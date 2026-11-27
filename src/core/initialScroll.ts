@@ -1,11 +1,15 @@
 import { calculateOffsetForIndex } from "@/core/calculateOffsetForIndex";
 import { calculateOffsetWithOffsetPosition } from "@/core/calculateOffsetWithOffsetPosition";
 import { clampScrollOffset } from "@/core/clampScrollOffset";
+import { isEndOfContentTarget } from "@/core/endOfContentTarget";
+import { finishInitialScroll } from "@/core/finishInitialScroll";
 import { setInitialScrollSession } from "@/core/initialScrollSession";
+import { getObservedScrollOffset } from "@/core/observedScroll";
 import { scrollTo } from "@/core/scrollTo";
-import { clampScrollIndex } from "@/core/scrollToIndex";
+import { Platform } from "@/platform/Platform";
 import type { StateContext } from "@/state/state";
 import type { ScrollIndexWithOffset, ScrollIndexWithOffsetAndContentOffset } from "@/types.base";
+import { clampScrollIndex } from "@/utils/clampScrollIndex";
 import { getItemSizeAtIndex } from "@/utils/getItemSize";
 import { resetInitialRenderState } from "@/utils/setInitialRenderState";
 
@@ -28,6 +32,9 @@ export function dispatchInitialScroll(
 
     scrollTo(ctx, {
         animated: false,
+        clampToContentContainerMinSize:
+            ctx.state.initialScrollSession?.kind === "offset" ||
+            isEndOfContentTarget(target, ctx.state.props.data.length),
         forceScroll,
         index: index !== undefined && index >= 0 ? index : undefined,
         isInitialScroll: true,
@@ -69,8 +76,12 @@ export function resolveInitialScrollOffset(ctx: StateContext, initialScroll: Scr
     }
 
     const baseOffset = initialScroll.index !== undefined ? calculateOffsetForIndex(ctx, initialScroll.index) : 0;
-    const resolvedOffset = calculateOffsetWithOffsetPosition(ctx, baseOffset, initialScroll);
-    return clampScrollOffset(ctx, resolvedOffset, initialScroll);
+    const target = {
+        ...initialScroll,
+        clampToContentContainerMinSize: isEndOfContentTarget(initialScroll, state.props.data.length),
+    };
+    const resolvedOffset = calculateOffsetWithOffsetPosition(ctx, baseOffset, target);
+    return clampScrollOffset(ctx, resolvedOffset, target);
 }
 
 function getAdvanceableInitialScrollState(
@@ -87,6 +98,7 @@ function getAdvanceableInitialScrollState(
 
     if (
         !initialScroll ||
+        state.hasEstimatedInitialLayout ||
         shouldWaitForInitialLayout ||
         didFinishInitialScroll ||
         (scrollingTo && !isInitialScrollInProgress)
@@ -124,10 +136,14 @@ function advanceMeasuredInitialScroll(
         initialScroll.contentOffset === undefined || Math.abs(initialScroll.contentOffset - resolvedOffset) > 1;
     const didActiveInitialTargetChange =
         activeInitialTargetOffset !== undefined && Math.abs(activeInitialTargetOffset - resolvedOffset) > 1;
+    // An instant web request can be clamped before a footer's new extent commits.
+    // Its optimistic cache is not evidence that the browser applied that offset.
+    const observedOffset = options?.forceScroll && Platform.OS === "web" ? getObservedScrollOffset(ctx) : undefined;
     const isAlreadyAtDesiredInitialTarget =
         activeInitialTargetOffset !== undefined &&
         Math.abs(state.scroll - resolvedOffset) <= 1 &&
-        Math.abs(state.scrollPending - resolvedOffset) <= 1;
+        Math.abs(state.scrollPending - resolvedOffset) <= 1 &&
+        (observedOffset === undefined || Math.abs(observedOffset - resolvedOffset) <= 1);
 
     if (!options?.forceScroll && !didOffsetChange && isInitialScrollInProgress && !didActiveInitialTargetChange) {
         return false;
@@ -170,7 +186,19 @@ function advanceOffsetInitialScroll(
     const isAlreadyAtDesiredInitialTarget =
         Math.abs(state.scroll - resolvedOffset) <= 1 && Math.abs(state.scrollPending - resolvedOffset) <= 1;
 
-    if (options?.forceScroll && isAlreadyAtDesiredInitialTarget) {
+    if (
+        options?.forceScroll &&
+        isAlreadyAtDesiredInitialTarget &&
+        Math.abs(getObservedScrollOffset(ctx) - resolvedOffset) <= 1
+    ) {
+        if (!state.scrollingTo) {
+            // No native event or active scroll will complete an already aligned session.
+            finishInitialScroll(ctx, {
+                preserveTarget: state.props.data.length === 0,
+                recalculateItems: true,
+                syncObservedOffset: true,
+            });
+        }
         return false;
     }
 
@@ -193,10 +221,6 @@ export function advanceCurrentInitialScrollSession(
     },
 ) {
     return ctx.state.initialScrollSession?.kind === "offset"
-        ? advanceOffsetInitialScroll(ctx, {
-              forceScroll: options?.forceScroll,
-          })
-        : advanceMeasuredInitialScroll(ctx, {
-              forceScroll: options?.forceScroll,
-          });
+        ? advanceOffsetInitialScroll(ctx, options)
+        : advanceMeasuredInitialScroll(ctx, options);
 }

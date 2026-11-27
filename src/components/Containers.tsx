@@ -1,20 +1,22 @@
 // biome-ignore lint/style/useImportType: Leaving this out makes it crash in some environments
 import * as React from "react";
-import { useRef } from "react";
 
 import { ContainerLayoutCoordinator } from "@/components/ContainerLayoutCoordinator";
 import { ContainerSlot } from "@/components/ContainerSlot";
-import { useDOMOrder } from "@/hooks/useDOMOrder";
 import { useFreshDataTransitionVisibility } from "@/hooks/useFreshDataTransitionVisibility";
 import { useArr$, useStateContext } from "@/state/state";
 import type { StickyHeaderConfig } from "@/types.base";
 import { type GetRenderedItem, typedMemo } from "@/types.internal";
+import { hasActiveInitialScroll } from "@/utils/hasActiveInitialScroll";
 import { isHorizontalRTL } from "@/utils/rtl";
 
-interface ContainersProps<ItemT> {
+export interface ContainersProps<ItemT> {
+    contentRowGap?: number;
+    footer?: React.ReactNode;
     freshDataTransitionEpoch: number;
     horizontal: boolean;
     recycleItems: boolean;
+    renderRows?: boolean;
     ItemSeparatorComponent?: React.ComponentType<{ leadingItem: ItemT }>;
     getRenderedItem: GetRenderedItem;
     stickyHeaderConfig?: StickyHeaderConfig;
@@ -34,15 +36,13 @@ const ContainersInner = typedMemo(function ContainersInner({
     numColumns,
     children,
 }: ContainersInnerProps) {
-    const ref = useRef<HTMLDivElement | null>(null);
     const ctx = useStateContext();
     const columnWrapperStyle = ctx.columnWrapperStyle;
     const isHorizontalRTLList = isHorizontalRTL(ctx.state);
     const [otherAxisSize, readyToRender, totalSize] = useArr$(["otherAxisSize", "readyToRender", "totalSize"]);
-    const isVisible = useFreshDataTransitionVisibility(!!readyToRender, freshDataTransitionEpoch);
-
-    // Initialize DOM reordering hook - noop in react namtive
-    useDOMOrder(ref);
+    const showEstimatedItems = !!ctx.state.hasEstimatedInitialLayout && !hasActiveInitialScroll(ctx.state);
+    const canShowItems = !!readyToRender || showEstimatedItems;
+    const isVisible = useFreshDataTransitionVisibility(canShowItems, freshDataTransitionEpoch);
 
     const style: React.CSSProperties = horizontal
         ? {
@@ -55,7 +55,7 @@ const ContainersInner = typedMemo(function ContainersInner({
           }
         : { height: totalSize, minWidth: otherAxisSize, opacity: isVisible ? 1 : 0, position: "relative" };
 
-    if (!isVisible) {
+    if (!canShowItems) {
         style.pointerEvents = "none";
     }
 
@@ -80,7 +80,7 @@ const ContainersInner = typedMemo(function ContainersInner({
     }
 
     return (
-        <div ref={ref} style={style}>
+        <div style={style}>
             <ContainerLayoutCoordinator>{children}</ContainerLayoutCoordinator>
         </div>
     );

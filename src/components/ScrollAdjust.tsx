@@ -8,14 +8,14 @@ export function getScrollAdjustAxis(horizontal: boolean) {
     return horizontal
         ? {
               contentSizeKey: "scrollWidth" as const,
-              paddingEndProp: "paddingRight" as const,
+              sizeProp: "width" as const,
               viewportSizeKey: "clientWidth" as const,
               x: 1,
               y: 0,
           }
         : {
               contentSizeKey: "scrollHeight" as const,
-              paddingEndProp: "paddingBottom" as const,
+              sizeProp: "height" as const,
               viewportSizeKey: "clientHeight" as const,
               x: 0,
               y: 1,
@@ -46,9 +46,16 @@ export function ScrollAdjust() {
     const ctx = useStateContext();
     const lastScrollOffsetRef = React.useRef(0);
     const lastScrollAdjustUserOffsetRef = React.useRef(0);
-    const resetPaddingRafRef = React.useRef<number | undefined>(undefined);
-    const temporaryPaddingRef = React.useRef<{ baseline: string; value: string } | undefined>(undefined);
+    const resetSpacerRafRef = React.useRef<number | undefined>(undefined);
+    const spacerRef = React.useRef<HTMLDivElement | null>(null);
     const contentNodeRef = React.useRef<HTMLElement | null>(null);
+    const clearTemporaryScrollAdjust = React.useCallback(() => {
+        if (resetSpacerRafRef.current !== undefined) cancelAnimationFrame(resetSpacerRafRef.current);
+        resetSpacerRafRef.current = undefined;
+        const spacer = spacerRef.current;
+        spacer?.remove();
+        spacerRef.current = null;
+    }, []);
 
     const callback = React.useCallback(() => {
         const scrollAdjust = peek$(ctx, "scrollAdjust");
@@ -72,12 +79,23 @@ export function ScrollAdjust() {
                 // An offscreen list must not pull a shared scroll owner back to itself.
                 const isOutsideList = scroller?.isScrollInRange?.() === false;
                 const userOffsetDelta = (scrollAdjustUserOffset || 0) - lastScrollAdjustUserOffsetRef.current;
-                const intendedScroll = userOffsetDelta !== 0 ? currentScroll + userOffsetDelta : ctx.state.scroll;
+                const isRelative = ctx.state.scrollAdjustHandler.isRelativeWebAdjust?.(scrollAdjust || 0);
+                const remainder = isRelative ? ctx.state.scrollAdjustHandler.getWebAdjustRemainder(currentScroll) : 0;
+                const intendedScroll =
+                    userOffsetDelta !== 0 || isRelative
+                        ? currentScroll + signalScrollDelta + remainder
+                        : ctx.state.scroll;
                 // Reconcile against live DOM scroll so browser clamping/anchoring
                 // is not applied a second time as another relative scrollBy.
                 const scrollDelta = intendedScroll - currentScroll;
                 const shouldScroll = !isOutsideList && Math.abs(scrollDelta) > 0.01;
-                const scrollBy = () => scrollAdjustBy(el, axis.x * scrollDelta, axis.y * scrollDelta);
+                const scrollBy = () => {
+                    scrollAdjustBy(el, axis.x * scrollDelta, axis.y * scrollDelta);
+                    const after =
+                        (isExternal ? scroller?.getCurrentScrollOffset?.() : undefined) ??
+                        (horizontal ? el.scrollLeft : el.scrollTop);
+                    ctx.state.scrollAdjustHandler.recordWebAdjust?.(intendedScroll, after);
+                };
 
                 contentNodeRef.current = contentNode;
 
@@ -87,63 +105,62 @@ export function ScrollAdjust() {
                     const nextScroll = parentScroll + scrollDelta;
                     const needsTemporaryPadding =
                         scrollDelta > 0 &&
-                        !ctx.state.adjustingFromInitialMount &&
+                        !ctx.state.initialMountAdjusts?.length &&
                         totalSize < nextScroll + viewportSize;
 
                     if (needsTemporaryPadding) {
-                        // If trying to scroll out of bounds of the scroll element's current size
-                        // it would clamp the scroll and not do the full adjustment. So we need to
-                        // add padding to the scroll element to allow the scroll to complete.
-                        const currentInlinePaddingEnd = contentNode.style[axis.paddingEndProp];
-                        const previousTemporaryPadding = temporaryPaddingRef.current;
-                        const baselinePaddingEnd =
-                            previousTemporaryPadding?.value === currentInlinePaddingEnd
-                                ? previousTemporaryPadding.baseline
-                                : currentInlinePaddingEnd;
-                        const pad = (nextScroll + viewportSize - totalSize) * 2;
-                        const currentPaddingEnd = Number.parseFloat(
-                            window.getComputedStyle(contentNode)[axis.paddingEndProp],
-                        );
-                        const temporaryPaddingEnd = `${(currentPaddingEnd || 0) + pad}px`;
-                        contentNode.style[axis.paddingEndProp] = temporaryPaddingEnd;
-                        temporaryPaddingRef.current = {
-                            baseline: baselinePaddingEnd,
-                            value: contentNode.style[axis.paddingEndProp],
-                        };
-                        // Force a layout update by reading from DOM
-                        void contentNode.offsetHeight;
-
-                        scrollBy();
-                        // Multiple adjustments can happen in one frame; keep only the latest padding reset.
-                        if (resetPaddingRafRef.current !== undefined) {
-                            cancelAnimationFrame(resetPaddingRafRef.current);
+                        let spacer = spacerRef.current;
+                        if (!spacer || spacer.parentElement !== contentNode) {
+                            clearTemporaryScrollAdjust();
+                            spacer = contentNode.ownerDocument.createElement("div");
+                            spacer.setAttribute("aria-hidden", "true");
+                            Object.assign(spacer.style, {
+                                flexShrink: "0",
+                                height: "0px",
+                                overflowAnchor: "none",
+                                width: "0px",
+                            });
+                            contentNode.appendChild(spacer);
+                            spacerRef.current = spacer;
                         }
-
-                        // After the scrollBy, revert the temporary end padding.
-                        resetPaddingRafRef.current = requestAnimationFrame(() => {
-                            const temporaryPadding = temporaryPaddingRef.current;
-                            resetPaddingRafRef.current = undefined;
-                            temporaryPaddingRef.current = undefined;
-                            if (contentNode.style[axis.paddingEndProp] === temporaryPadding?.value) {
-                                contentNode.style[axis.paddingEndProp] = temporaryPadding.baseline;
-                            }
-                        });
+                        const pad = (nextScroll + viewportSize - totalSize) * 2;
+                        const currentSize = Number.parseFloat(spacer.style[axis.sizeProp]) || 0;
+                        spacer.style.display = "block";
+                        spacer.style[axis.sizeProp] = `${currentSize + pad}px`;
+                        // Commit the extra scroll range before the browser can clamp scrollBy.
+                        void spacer.offsetHeight;
+                        scrollBy();
+                        if (resetSpacerRafRef.current !== undefined) {
+                            cancelAnimationFrame(resetSpacerRafRef.current);
+                        }
+                        resetSpacerRafRef.current = requestAnimationFrame(clearTemporaryScrollAdjust);
                     } else {
                         scrollBy();
                     }
                 } else if (shouldScroll) {
                     scrollBy();
+                } else if (isRelative && !isOutsideList) {
+                    // A new correction can exactly consume old rounding credit
+                    // without a DOM write. Do not carry that credit again.
+                    ctx.state.scrollAdjustHandler.recordWebAdjust(intendedScroll, currentScroll);
                 }
             }
 
             lastScrollOffsetRef.current = scrollOffset;
             lastScrollAdjustUserOffsetRef.current = scrollAdjustUserOffset || 0;
         }
-    }, [ctx]);
+    }, [clearTemporaryScrollAdjust, ctx]);
 
     useValueListener$("scrollAdjust", callback);
     useValueListener$("scrollAdjustUserOffset", callback);
 
-    // Don't render, this manually operates on the DOM
+    React.useLayoutEffect(() => {
+        ctx.clearTemporaryScrollAdjust = clearTemporaryScrollAdjust;
+        return () => {
+            clearTemporaryScrollAdjust();
+            ctx.clearTemporaryScrollAdjust = undefined;
+        };
+    }, [clearTemporaryScrollAdjust, ctx]);
+
     return null;
 }

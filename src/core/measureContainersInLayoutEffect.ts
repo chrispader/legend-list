@@ -1,39 +1,89 @@
-import { setContainerLayoutBaseline } from "@/core/containerLayoutBaseline";
-import { type ItemSizeMeasurement, updateItemSizesBatch } from "@/core/updateItemSizes";
+import { evaluateBootstrapInitialScroll } from "@/core/bootstrapInitialScroll";
+import { getScrollRangeEnd } from "@/core/clampScrollOffset";
+import { measureContainerLayoutSize, setContainerLayoutBaseline } from "@/core/containerLayoutBaseline";
+import { type ItemSizeMeasurement, isContainerItemCurrent, updateItemSizesBatch } from "@/core/updateItemSizes";
 import { peek$, type StateContext } from "@/state/state";
+import { getId } from "@/utils/getId";
 
 export function measureContainersInLayoutEffect(
     ctx: StateContext,
     targetContainerIds: ReadonlySet<number> | null = null,
 ) {
-    const measurements: ItemSizeMeasurement[] = [];
-    const containerIds = targetContainerIds ?? ctx.viewRefs.keys();
+    const dataChangeEpoch = ctx.state.dataChangeEpoch;
+    const measurements: (ItemSizeMeasurement & { containerId: number; generation: number })[] = [];
+    const containerIds =
+        ctx.state.initialScrollSession?.kind === "bootstrap" && ctx.state.initialScrollSession.bootstrap
+            ? ctx.viewRefs.keys()
+            : (targetContainerIds ?? ctx.viewRefs.keys());
 
     for (const containerId of containerIds) {
         const viewRef = ctx.viewRefs.get(containerId);
         const itemKey = peek$(ctx, `containerItemKey${containerId}`);
         const element = viewRef?.current as HTMLElement | null;
-        if (itemKey !== undefined && element) {
-            const rect = element.getBoundingClientRect();
-            // A detached or display: none list reports 0x0 for every row. Recording that
-            // collapses the list, which mounts more containers that also measure 0x0, and
-            // repeats until React throws "Maximum update depth exceeded". The observer path
-            // ignores 0x0 for the same reason; the next real layout measures the row.
-            if (rect.width === 0 && rect.height === 0) {
-                continue;
-            }
+        if (itemKey !== undefined && element && isContainerItemCurrent(ctx, containerId, itemKey)) {
+            const generation = ctx.state.containerItemGenerations[containerId] ?? 0;
+            const size = measureContainerLayoutSize(element);
+            // A hidden or detached row has no layout box. Keep its last measured size.
+            if (size.width === 0 && size.height === 0) continue;
             // ResizeObserver uses this same border-box baseline to recognize the
             // subsequent observer delivery as confirmation rather than a new change.
-            setContainerLayoutBaseline(element, rect);
+            setContainerLayoutBaseline(element, size);
             measurements.push({
                 containerId,
+                generation,
                 itemKey,
-                size: { height: rect.height, width: rect.width },
+                size,
             });
         }
     }
 
     if (measurements.length > 0) {
-        updateItemSizesBatch(ctx, measurements);
+        const layoutState = ctx.state;
+        const wasMeasuringInLayout = layoutState.measuringContainersInLayout;
+        layoutState.measuringContainersInLayout = true;
+        try {
+            updateItemSizesBatch(ctx, measurements);
+        } finally {
+            layoutState.measuringContainersInLayout = wasMeasuringInLayout;
+        }
+        if (ctx.state.initialScrollSession?.kind !== "bootstrap" || !ctx.state.initialScrollSession.bootstrap) return;
+        ctx.state.scheduledWork.microtask(() => {
+            const state = ctx.state;
+            const bootstrap =
+                state.initialScrollSession?.kind === "bootstrap" ? state.initialScrollSession.bootstrap : undefined;
+            if (bootstrap?.visibleIndices?.length && state.dataChangeEpoch === dataChangeEpoch) {
+                const measuredKeys = new Set<string>();
+                for (const { containerId, generation, itemKey } of measurements) {
+                    if (
+                        peek$(ctx, `containerItemKey${containerId}`) === itemKey &&
+                        (state.containerItemGenerations[containerId] ?? 0) === generation
+                    ) {
+                        measuredKeys.add(itemKey);
+                    }
+                }
+                const isCurrentViewportMeasured = bootstrap.visibleIndices.every((index) =>
+                    measuredKeys.has(getId(state, index)),
+                );
+                const isCurrentBufferMeasured = Array.from(state.containerItemKeys.keys()).every((key) => {
+                    const index = state.indexByKey.get(key);
+                    return (
+                        index === undefined ||
+                        index < state.startBuffered ||
+                        index > state.endBuffered ||
+                        measuredKeys.has(key)
+                    );
+                });
+                const physicalMax = state.refScroller.current?.getMaxScrollOffset?.();
+                const layoutMax = getScrollRangeEnd(ctx);
+                if (
+                    isCurrentViewportMeasured &&
+                    isCurrentBufferMeasured &&
+                    physicalMax !== undefined &&
+                    Math.abs(physicalMax - layoutMax) <= 1
+                ) {
+                    evaluateBootstrapInitialScroll(ctx);
+                }
+            }
+        }, "bootstrapMeasuredLayout");
     }
 }

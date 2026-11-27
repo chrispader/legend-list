@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import "../setup";
 
 import { prepareMVCP, resolvePendingNativeMVCPAdjust } from "@/core/mvcp";
@@ -13,6 +13,210 @@ const originalPlatform = Platform.OS;
 describe("mvcp helpers", () => {
     afterEach(() => {
         Platform.OS = originalPlatform;
+    });
+
+    it.each([
+        { bottom: 0, manual: -20, minimum: undefined },
+        { bottom: 20, manual: -170, minimum: 350 },
+    ])("predicts the native shrink clamp with minimum $minimum", ({ minimum, bottom, manual }) => {
+        Platform.OS = "ios";
+        const ctx = createMockContext(
+            { totalSize: 100 },
+            {
+                pendingNativeMVCPAdjust: {
+                    amount: -200,
+                    furthestProgressTowardAmount: 0,
+                    manualApplied: 0,
+                    startScroll: 100,
+                },
+                props: {
+                    contentContainerMinSize: minimum,
+                    contentInset: { bottom, left: 0, right: 0, top: 80 },
+                    maintainVisibleContentPosition: normalizeMaintainVisibleContentPosition(true),
+                },
+                scroll: 100,
+                scrollLength: 300,
+            },
+        );
+        const requestAdjustSpy = spyOn(requestAdjustModule, "requestAdjust");
+        try {
+            expect(prepareMVCP(ctx, true)).toBeUndefined();
+            expect(ctx.state.pendingNativeMVCPAdjust?.manualApplied).toBe(manual);
+            expect(requestAdjustSpy).toHaveBeenCalledWith(ctx, manual, "data");
+        } finally {
+            requestAdjustSpy.mockRestore();
+            ctx.state.scheduledWork.dispose();
+        }
+    });
+
+    it.each([
+        { bottom: 0, end: -80, minimum: undefined, remainder: -70 },
+        { bottom: 20, end: 70, minimum: 350, remainder: -220 },
+    ])("settles a pending native shrink with minimum $minimum", ({ minimum, bottom, end, remainder }) => {
+        Platform.OS = "ios";
+        const ctx = createMockContext(
+            { totalSize: 100 },
+            {
+                pendingNativeMVCPAdjust: {
+                    amount: -250,
+                    furthestProgressTowardAmount: 0,
+                    manualApplied: 0,
+                    startScroll: 100,
+                },
+                props: { contentContainerMinSize: minimum, contentInset: { bottom, left: 0, right: 0, top: 80 } },
+                scroll: 100,
+                scrollLength: 300,
+            },
+        );
+        const requestAdjustSpy = spyOn(requestAdjustModule, "requestAdjust");
+        try {
+            expect(resolvePendingNativeMVCPAdjust(ctx, end)).toBe(true);
+            expect(ctx.state.pendingNativeMVCPAdjust).toBeUndefined();
+            expect(requestAdjustSpy).toHaveBeenCalledWith(ctx, remainder, "data");
+        } finally {
+            requestAdjustSpy.mockRestore();
+            ctx.state.scheduledWork.dispose();
+        }
+    });
+
+    it.each([
+        { bottom: 0, end: -80, minimum: undefined },
+        { bottom: 20, end: 70, minimum: 350 },
+    ])("syncs a shrinking end target with minimum $minimum", ({ minimum, bottom, end }) => {
+        Platform.OS = "ios";
+        const ctx = createMockContext(
+            { totalSize: 500 },
+            {
+                idCache: ["a", "b"],
+                indexByKey: new Map([
+                    ["a", 0],
+                    ["b", 1],
+                ]),
+                positions: [0, 400],
+                props: {
+                    contentContainerMinSize: minimum,
+                    contentInset: { bottom, left: 0, right: 0, top: 80 },
+                    data: [{ id: "a" }, { id: "b" }],
+                    getFixedItemSize: () => 100,
+                    keyExtractor: (item: { id: string }) => item.id,
+                    maintainVisibleContentPosition: normalizeMaintainVisibleContentPosition(true),
+                },
+                scroll: 200,
+                scrollingTo: { animated: false, index: 1, itemSize: 100, offset: 200, viewPosition: 1 },
+                scrollLength: 300,
+                scrollPending: 200,
+            },
+        );
+        const requestAdjustSpy = spyOn(requestAdjustModule, "requestAdjust");
+        try {
+            const adjust = prepareMVCP(ctx);
+            ctx.state.totalSize = 100;
+            ctx.state.positions[1] = 0;
+            adjust?.();
+            expect(ctx.state.scroll).toBe(end);
+            expect(ctx.state.scrollPending).toBe(end);
+            expect(requestAdjustSpy).not.toHaveBeenCalled();
+        } finally {
+            requestAdjustSpy.mockRestore();
+            ctx.state.scheduledWork.dispose();
+        }
+    });
+
+    it("keeps the keyed scroll target across a prepend before the key map is rebuilt", () => {
+        Platform.OS = "web";
+        const ctx = createMockContext(
+            { totalSize: 1000 },
+            {
+                indexByKey: new Map([
+                    ["a", 0],
+                    ["b", 1],
+                    ["c", 2],
+                ]),
+                positions: [0, 100, 200],
+                props: {
+                    data: [{ id: "new" }, { id: "a" }, { id: "b" }, { id: "c" }],
+                    getFixedItemSize: (item: { id: string }) => (item.id === "b" ? 200 : 100),
+                    keyExtractor: (item: { id: string }) => item.id,
+                    maintainVisibleContentPosition: normalizeMaintainVisibleContentPosition(true),
+                },
+                scroll: 100,
+                scrollingTo: { animated: true, index: 1, itemSize: 200, key: "b", offset: 100, viewPosition: 0.5 },
+            },
+        );
+        const adjust = prepareMVCP(ctx, true);
+        ctx.state.indexByKey.clear();
+        for (const [index, item] of ctx.state.props.data.entries()) ctx.state.indexByKey.set(item.id, index);
+        ctx.state.positions.splice(0, 0, 0);
+        ctx.state.positions[1] = 100;
+        ctx.state.positions[2] = 200;
+        ctx.state.positions[3] = 300;
+        adjust?.();
+        expect(ctx.state.scrollingTo?.index).toBe(2);
+        expect(ctx.state.scroll).toBe(200);
+        ctx.state.scheduledWork.dispose();
+    });
+
+    it("does not restore native row positions while both restoration modes are disabled", () => {
+        Platform.OS = "ios";
+        const ctx = createMockContext(
+            { totalSize: 1000 },
+            {
+                didContainersLayout: true,
+                idCache: ["item-0", "item-1"],
+                idsInView: ["item-1"],
+                indexByKey: new Map([
+                    ["item-0", 0],
+                    ["item-1", 1],
+                ]),
+                positions: [0, 100],
+                props: {
+                    data: [{ id: 0 }, { id: 1 }],
+                    keyExtractor: (item: { id: number }) => `item-${item.id}`,
+                    maintainVisibleContentPosition: normalizeMaintainVisibleContentPosition(false),
+                },
+                scroll: 120,
+            },
+        );
+        for (const dataChanged of [false, true]) {
+            const adjust = prepareMVCP(ctx, dataChanged);
+            ctx.state.positions[1] += 50;
+            adjust?.();
+            expect(ctx.state.scroll).toBe(120);
+            expect(ctx.values.get("scrollAdjust")).toBe(0);
+            expect(ctx.state.pendingNativeMVCPAdjust).toBeUndefined();
+        }
+    });
+
+    it("restores an explicit reader anchor even while both restoration modes are disabled", () => {
+        Platform.OS = "ios";
+        for (const dataChanged of [false, true]) {
+            const ctx = createMockContext(
+                { readyToRender: true, totalSize: 1000 },
+                {
+                    didContainersLayout: true,
+                    idCache: ["item-0", "item-1"],
+                    idsInView: ["item-1"],
+                    indexByKey: new Map([
+                        ["item-0", 0],
+                        ["item-1", 1],
+                    ]),
+                    positions: [0, 100],
+                    props: {
+                        data: [{ id: 0 }, { id: 1 }],
+                        keyExtractor: (item: { id: number }) => `item-${item.id}`,
+                        maintainVisibleContentPosition: normalizeMaintainVisibleContentPosition(false),
+                    },
+                    scroll: 120,
+                    visibleContentAnchor: { key: "item-1", offset: 20 },
+                },
+            );
+            const adjust = prepareMVCP(ctx, dataChanged);
+            ctx.state.positions[1] += 50;
+            adjust?.();
+            expect(ctx.state.scroll - ctx.state.positions[1]!).toBe(20);
+            expect(ctx.state.pendingNativeMVCPAdjust).toBeUndefined();
+            ctx.state.scheduledWork.dispose();
+        }
     });
 
     it("clears a web anchor lock immediately when its anchor disappears", () => {
@@ -48,6 +252,51 @@ describe("mvcp helpers", () => {
         expect(adjustFunction).toBeDefined();
         expect(mockCtx.state.mvcpAnchorLock).toBeUndefined();
     });
+
+    it.each([
+        { offset: 50, shouldAnimate: true, threshold: 50 },
+        { offset: 51, shouldAnimate: false, threshold: 50 },
+        { offset: 50, shouldAnimate: false, threshold: undefined },
+    ])(
+        "handles a web prepend at offset $offset with start threshold $threshold",
+        async ({ offset, shouldAnimate, threshold }) => {
+            Platform.OS = "web";
+            const ctx = createMockContext(
+                { readyToRender: true, totalSize: 300 },
+                {
+                    didContainersLayout: true,
+                    idsInView: ["first"],
+                    indexByKey: new Map([["first", 0]]),
+                    positions: [0],
+                    props: {
+                        data: ["first"],
+                        maintainVisibleContentPosition: normalizeMaintainVisibleContentPosition({
+                            autoscrollToTopThreshold: threshold,
+                            data: true,
+                        }),
+                    },
+                    scroll: offset,
+                },
+            );
+            const scrollTo = mock(() => expect(ctx.state.scroll).toBe(offset + 300));
+            ctx.scrollTo = scrollTo;
+
+            const adjust = prepareMVCP(ctx, true);
+            ctx.state.props.data = ["new", "first"];
+            ctx.state.indexByKey.set("new", 0);
+            ctx.state.indexByKey.set("first", 1);
+            ctx.state.positions[1] = 300;
+            adjust!();
+            await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+            expect(ctx.state.scroll).toBe(offset + 300);
+            if (shouldAnimate) {
+                expect(scrollTo).toHaveBeenCalledWith({ animated: true, offset: 0 });
+            } else {
+                expect(scrollTo).not.toHaveBeenCalled();
+            }
+        },
+    );
 
     it("does not refresh the web anchor lock while a scrollTo target is active", () => {
         Platform.OS = "web";

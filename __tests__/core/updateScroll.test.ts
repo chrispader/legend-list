@@ -1,14 +1,73 @@
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import "../setup"; // Import global test setup
 
 import * as doMaintainScrollAtEndModule from "@/core/doMaintainScrollAtEnd";
+import { onScroll } from "@/core/onScroll";
 import { updateScroll } from "@/core/updateScroll";
 import * as flushSyncModule from "@/platform/flushSync";
 import { Platform } from "@/platform/Platform";
 import type { StateContext } from "@/state/state";
 import { peek$ } from "@/state/state";
+import { checkAtBottom } from "@/utils/checkAtBottom";
+import { createImperativeHandle } from "@/utils/createImperativeHandle";
+import * as getScrollVelocityModule from "@/utils/getScrollVelocity";
 import * as requestAdjustModule from "@/utils/requestAdjust";
 import { createMockContext } from "../__mocks__/createMockContext";
+import { installFakeClock } from "../helpers/webScrollHarness";
+
+describe("updateScroll end state after content growth", () => {
+    for (const os of ["ios", "android", "web"] as const) {
+        it(`refreshes isAtEnd for settling offsets below the item recalculation threshold on ${os}`, () => {
+            const originalPlatform = Platform.OS;
+            Platform.OS = os;
+            const calculateItems = mock(() => {});
+            const ctx = createMockContext(
+                { totalSize: 1000 },
+                {
+                    props: { data: ["a"], maintainScrollAtEnd: true, maintainScrollAtEndThreshold: 0 },
+                    queuedInitialLayout: true,
+                    scroll: 700,
+                    scrollLength: 300,
+                    triggerCalculateItemsInView: calculateItems,
+                },
+            );
+            const handle = createImperativeHandle(ctx);
+            const sendScroll = (offset: number) =>
+                onScroll(ctx, {
+                    nativeEvent: {
+                        contentOffset: { x: 0, y: offset },
+                        contentSize: { height: 1065.625, width: 300 },
+                        layoutMeasurement: { height: 300, width: 300 },
+                    },
+                } as any);
+            try {
+                checkAtBottom(ctx);
+                expect(handle.getState().isAtEnd).toBe(true);
+                ctx.state.props.data = ["a", "b"];
+                ctx.values.set("totalSize", 1065.625);
+                // The follow approaches the new end, then settles by less than two pixels.
+                sendScroll(764.125);
+                expect(handle.getState().distanceFromEnd).toBe(1.5);
+                expect(handle.getState().isAtEnd).toBe(false);
+                calculateItems.mockClear();
+                const onAtEnd = mock(() => {});
+                handle.getState().listen("isAtEnd", onAtEnd);
+                for (const gap of [0, 1]) {
+                    sendScroll(765.625 - gap);
+                    expect(handle.getState().distanceFromEnd).toBe(gap);
+                    expect(handle.getState().isAtEnd).toBe(true);
+                }
+                expect(calculateItems).not.toHaveBeenCalled();
+                sendScroll(765.625 - 1.25);
+                expect(handle.getState().isAtEnd).toBe(false);
+                expect(onAtEnd.mock.calls).toEqual([[true], [false]]);
+            } finally {
+                ctx.state.scheduledWork.dispose();
+                Platform.OS = originalPlatform;
+            }
+        });
+    }
+});
 
 describe("updateScroll large user jumps", () => {
     let mockCtx: StateContext;
@@ -213,6 +272,7 @@ describe("updateScroll large user jumps", () => {
     });
 
     it("uses visible-first drawDistance for large user scroll jumps and prewarms the full range", () => {
+        const clock = installFakeClock();
         const triggerCalculateItemsInViewSpy = spyOn(mockCtx.state, "triggerCalculateItemsInView").mockImplementation(
             () => undefined,
         );
@@ -227,10 +287,10 @@ describe("updateScroll large user jumps", () => {
                 scrollVelocity: 0,
             },
         ]);
-        expect(rafCallbacks).toHaveLength(1);
         expect(mockCtx.state.scheduledWork.has("fullDrawDistancePrewarm")).toBe(true);
 
-        rafCallbacks[0](Date.now());
+        clock.advance(100);
+        clock.restore();
 
         expect(triggerCalculateItemsInViewSpy.mock.calls[1]).toEqual([]);
         expect(mockCtx.state.scheduledWork.has("fullDrawDistancePrewarm")).toBe(false);
@@ -238,6 +298,7 @@ describe("updateScroll large user jumps", () => {
     });
 
     it("dedupes full drawDistance prewarm passes across repeated large user scroll jumps", () => {
+        const clock = installFakeClock();
         const triggerCalculateItemsInViewSpy = spyOn(mockCtx.state, "triggerCalculateItemsInView").mockImplementation(
             () => undefined,
         );
@@ -261,8 +322,11 @@ describe("updateScroll large user jumps", () => {
                 }),
             ],
         ]);
-        expect(rafCallbacks).toHaveLength(1);
         expect(mockCtx.state.scheduledWork.has("fullDrawDistancePrewarm")).toBe(true);
+        clock.advance(100);
+        clock.restore();
+
+        expect(triggerCalculateItemsInViewSpy).toHaveBeenCalledTimes(3);
         triggerCalculateItemsInViewSpy.mockRestore();
     });
 
@@ -676,5 +740,287 @@ describe("updateScroll mvcp active mode", () => {
         expect(mockCtx.state.pendingNativeMVCPAdjust).toBeUndefined();
         expect(mockCtx.state.pendingMaintainScrollAtEnd).toBe(false);
         expect(doMaintainScrollAtEndSpy).toHaveBeenCalledWith(mockCtx);
+    });
+});
+
+describe("updateScroll user scroll ownership", () => {
+    const originalPlatform = Platform.OS;
+
+    afterEach(() => {
+        Platform.OS = originalPlatform;
+    });
+
+    function createUserScrollContext(isFollowingEnd = false) {
+        const onUserScroll = mock(() => {});
+        const ctx = createMockContext(
+            { isFollowingEnd },
+            { props: { onUserScroll }, scroll: 500, scrollLength: 100, triggerCalculateItemsInView: () => {} },
+        );
+        return { ctx, onUserScroll };
+    }
+
+    it.each(["ios", "android"] as const)("releases native following after an unowned scroll away on %s", (platform) => {
+        Platform.OS = platform;
+        const ctx = createMockContext(
+            { isFollowingEnd: true, totalSize: 1000 },
+            {
+                didContainersLayout: true,
+                didFinishInitialScroll: true,
+                props: { data: [{}], maintainScrollAtEnd: true },
+                queuedInitialLayout: true,
+                scroll: 800,
+                scrollLength: 200,
+                triggerCalculateItemsInView: () => {},
+            },
+        );
+
+        updateScroll(ctx, 0, true, { fromNativeScrollEvent: true });
+
+        expect(peek$(ctx, "isFollowingEnd")).toBe(false);
+        expect(peek$(ctx, "isWithinMaintainScrollAtEndThreshold")).toBe(false);
+        expect(doMaintainScrollAtEndModule.doMaintainScrollAtEnd(ctx)).toBe(false);
+        ctx.state.scheduledWork.dispose();
+    });
+
+    it.each(["isDragging", "isMomentumScrolling", "endFollowRearm"] as const)(
+        "leaves native gesture ownership with %s",
+        (owner) => {
+            Platform.OS = "ios";
+            const ctx = createMockContext(
+                { isFollowingEnd: true, totalSize: 1000 },
+                {
+                    isDragging: owner === "isDragging",
+                    isMomentumScrolling: owner === "isMomentumScrolling",
+                    scroll: 800,
+                    scrollLength: 200,
+                    triggerCalculateItemsInView: () => {},
+                    userScrollContentSize: owner === "isDragging" ? undefined : 1000,
+                },
+            );
+            if (owner === "endFollowRearm") {
+                ctx.state.scheduledWork.timeout(() => {}, 1000, "endFollowRearm");
+            }
+            updateScroll(ctx, 600, true, { fromNativeScrollEvent: true });
+            expect(peek$(ctx, "isFollowingEnd")).toBe(true);
+            ctx.state.scheduledWork.dispose();
+        },
+    );
+
+    it.each(["ios", "android"] as const)("releases following during baseline-free momentum on %s", (platform) => {
+        Platform.OS = platform;
+        const ctx = createMockContext(
+            { isFollowingEnd: true, totalSize: 1000 },
+            {
+                isMomentumScrolling: true,
+                scroll: 690,
+                scrollLength: 300,
+                triggerCalculateItemsInView: () => {},
+            },
+        );
+        try {
+            updateScroll(ctx, 400, true, { fromNativeScrollEvent: true });
+
+            expect(peek$(ctx, "isFollowingEnd")).toBe(false);
+            expect(peek$(ctx, "isWithinMaintainScrollAtEndThreshold")).toBe(false);
+            expect(ctx.state.endFollowInterrupted).toBe(true);
+            expect(ctx.state.isMomentumScrolling).toBe(true);
+        } finally {
+            ctx.state.scheduledWork.dispose();
+        }
+    });
+
+    it.each(["geometry", "adjustment", "mvcp", "request", "active maintenance", "pending maintenance"] as const)(
+        "preserves following during baseline-free momentum with %s ownership",
+        (owner) => {
+            Platform.OS = "ios";
+            const ctx = createMockContext(
+                { isFollowingEnd: true, totalSize: 1000 },
+                {
+                    isMomentumScrolling: true,
+                    scroll: 690,
+                    scrollLength: 300,
+                    triggerCalculateItemsInView: () => {},
+                },
+            );
+            if (owner === "adjustment") ctx.state.lastScrollAdjustForHistory = 10;
+            if (owner === "mvcp") {
+                ctx.state.pendingNativeMVCPAdjust = {
+                    amount: -300,
+                    furthestProgressTowardAmount: 0,
+                    manualApplied: 0,
+                    startScroll: 690,
+                };
+            }
+            if (owner === "request") {
+                ctx.state.scrollingTo = { offset: 400 } as any;
+                ctx.state.pendingScrollResolve = mock(() => {});
+            }
+            if (owner === "active maintenance") ctx.state.maintainingScrollAtEnd = "animated";
+            if (owner === "pending maintenance") ctx.state.pendingMaintainScrollAtEnd = true;
+            const request = ctx.state.scrollingTo;
+            const resolve = ctx.state.pendingScrollResolve;
+            try {
+                updateScroll(ctx, 400, true, {
+                    fromNativeScrollEvent: true,
+                    nativeGeometryChanged: owner === "geometry",
+                });
+
+                expect(peek$(ctx, "isFollowingEnd")).toBe(true);
+                expect(ctx.state.endFollowInterrupted).not.toBe(true);
+                expect(ctx.state.scrollingTo).toBe(request);
+                expect(ctx.state.pendingScrollResolve).toBe(resolve);
+                if (resolve) expect(resolve).not.toHaveBeenCalled();
+            } finally {
+                ctx.state.scheduledWork.dispose();
+            }
+        },
+    );
+
+    function createMomentumGeometryContext() {
+        const ctx = createMockContext(
+            { isFollowingEnd: false, totalSize: 1000 },
+            {
+                didContainersLayout: true,
+                didFinishInitialScroll: true,
+                endFollowInterrupted: true,
+                isMomentumScrolling: true,
+                props: { data: [{}], maintainScrollAtEnd: true, maintainScrollAtEndThreshold: 0.25 },
+                queuedInitialLayout: true,
+                scroll: 400,
+                scrollLength: 300,
+                triggerCalculateItemsInView: () => {},
+            },
+        );
+        ctx.state.scheduledWork.timeout(() => {}, 1000, "endFollowRearm");
+        return ctx;
+    }
+
+    it.each([
+        { follows: true, path: [690], start: 400 },
+        { follows: true, path: [700], start: 400 },
+        { follows: true, path: [690], start: 700 },
+        { follows: false, path: [690, 400], start: 400 },
+        { follows: true, path: [400, 690], start: 690 },
+    ])("recomputes baseline-free momentum geometry: %j", ({ start, path, follows }) => {
+        Platform.OS = "ios";
+        const ctx = createMomentumGeometryContext();
+        ctx.state.scroll = start;
+        try {
+            for (const offset of path) updateScroll(ctx, offset, true, { fromNativeScrollEvent: true });
+            expect(peek$(ctx, "isWithinMaintainScrollAtEndThreshold")).toBe(follows);
+            expect(peek$(ctx, "isFollowingEnd")).toBe(follows);
+            expect(ctx.state.endFollowInterrupted).toBe(!follows);
+            expect(ctx.state.scroll).toBe(path.at(-1)!);
+            expect(ctx.state.isMomentumScrolling).toBe(true);
+            expect(ctx.state.scheduledWork.has("endFollowRearm")).toBe(true);
+        } finally {
+            ctx.state.scheduledWork.dispose();
+        }
+    });
+
+    it.each(["active request", "pending request", "reader anchor", "app timer", "dragging", "release baseline"])(
+        "preserves %s ownership when near-end geometry is recomputed",
+        (owner) => {
+            Platform.OS = "ios";
+            const ctx = createMomentumGeometryContext();
+            if (owner === "active request") ctx.state.scrollingTo = { offset: 690 } as any;
+            if (owner === "pending request") ctx.state.pendingScrollResolve = mock(() => {});
+            if (owner === "reader anchor") ctx.state.visibleContentAnchor = { key: "reader", offset: 20 };
+            if (owner === "app timer") ctx.state.scheduledWork.timeout(() => {}, 1000, "appScrollRearm");
+            if (owner === "dragging") ctx.state.isDragging = true;
+            if (owner === "release baseline") ctx.state.userScrollContentSize = 1000;
+            const request = ctx.state.scrollingTo;
+            const resolve = ctx.state.pendingScrollResolve;
+            const anchor = ctx.state.visibleContentAnchor;
+            try {
+                updateScroll(ctx, 690, true);
+                expect(peek$(ctx, "isWithinMaintainScrollAtEndThreshold")).toBe(true);
+                expect(peek$(ctx, "isFollowingEnd")).toBe(false);
+                expect(ctx.state.endFollowInterrupted).toBe(true);
+                expect(ctx.state.scrollingTo).toBe(request);
+                expect(ctx.state.pendingScrollResolve).toBe(resolve);
+                expect(ctx.state.visibleContentAnchor).toBe(anchor);
+                if (resolve) expect(resolve).not.toHaveBeenCalled();
+            } finally {
+                ctx.state.scheduledWork.dispose();
+            }
+        },
+    );
+
+    it("reads the web maximum only when an observed offset moves backward", () => {
+        Platform.OS = "web";
+        const getMaxScrollOffset = mock(() => 700);
+        const ctx = createMockContext(
+            { isFollowingEnd: true, totalSize: 1000 },
+            {
+                didFinishInitialScroll: true,
+                props: { data: [{}], maintainScrollAtEnd: true },
+                queuedInitialLayout: true,
+                refScroller: { current: { getMaxScrollOffset } } as any,
+                scroll: 800,
+                scrollLength: 200,
+            },
+        );
+        try {
+            updateScroll(ctx, 800, true, { fromNativeScrollEvent: true });
+            expect(getMaxScrollOffset).not.toHaveBeenCalled();
+            updateScroll(ctx, 900, true, { fromNativeScrollEvent: true });
+            expect(getMaxScrollOffset).not.toHaveBeenCalled();
+            updateScroll(ctx, 700, true, { fromNativeScrollEvent: true });
+            expect(getMaxScrollOffset).toHaveBeenCalledTimes(1);
+            expect(peek$(ctx, "isFollowingEnd")).toBe(true);
+            updateScroll(ctx, 600, true, { fromNativeScrollEvent: true });
+            expect(getMaxScrollOffset).toHaveBeenCalledTimes(2);
+            expect(peek$(ctx, "isFollowingEnd")).toBe(false);
+        } finally {
+            ctx.state.scheduledWork.dispose();
+        }
+    });
+
+    it("never reports user input from unowned web or native offset events", () => {
+        for (const platform of ["web", "ios"] as const) {
+            Platform.OS = platform;
+            for (const following of [false, true]) {
+                const { ctx, onUserScroll } = createUserScrollContext(following);
+                updateScroll(ctx, 400, true, { fromNativeScrollEvent: true });
+                updateScroll(ctx, 350, true, { fromNativeScrollEvent: true });
+                expect(onUserScroll).not.toHaveBeenCalled();
+            }
+        }
+    });
+
+    it("releases the reader anchor only for user scroll events", () => {
+        const { ctx } = createUserScrollContext();
+        const anchor = { key: "reader", offset: 20 };
+        ctx.state.visibleContentAnchor = anchor;
+
+        updateScroll(ctx, 550, true);
+        expect(ctx.state.visibleContentAnchor).toBe(anchor);
+
+        updateScroll(ctx, 600, true, { fromNativeScrollEvent: true });
+        expect(ctx.state.visibleContentAnchor).toBeUndefined();
+    });
+});
+
+describe("updateScroll per-event work", () => {
+    it("skips adaptive-render and velocity work when adaptive render is off and the range does not recalculate", () => {
+        Platform.OS = "ios";
+        const ctx = createMockContext(
+            { readyToRender: true },
+            { scroll: 100, scrollLastCalculate: 100, scrollLength: 100 },
+        );
+        const cancelSpy = spyOn(ctx.state.scheduledWork, "cancel");
+        const velocitySpy = spyOn(getScrollVelocityModule, "getScrollVelocity");
+        try {
+            for (const offset of [100.5, 101, 101.5, 102]) {
+                updateScroll(ctx, offset, false, { fromNativeScrollEvent: true });
+            }
+            expect(cancelSpy).not.toHaveBeenCalledWith("adaptiveRender");
+            expect(velocitySpy).not.toHaveBeenCalled();
+            expect(peek$(ctx, "adaptiveRender")).toBe("normal");
+        } finally {
+            cancelSpy.mockRestore();
+            velocitySpy.mockRestore();
+        }
     });
 });

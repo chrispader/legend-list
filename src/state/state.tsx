@@ -1,6 +1,7 @@
 import * as React from "react";
 import { useSyncExternalStore } from "use-sync-external-store/shim";
 
+import type { DoScrollToParams } from "@/core/doScrollParams";
 import type { ScrollRequestTracker } from "@/core/scrollRequestTracker";
 import { type AnimatedValue, createAnimatedValue } from "@/platform/Animated";
 import type { LooseView } from "@/platform/scrollview-types";
@@ -10,9 +11,10 @@ import type {
     ViewAmountToken,
     ViewabilityAmountCallback,
     ViewabilityCallback,
+    ViewabilityConfigCallbackPair,
     ViewToken,
 } from "@/types.base";
-import type { InternalState, MaintainVisibleContentPositionNormalized } from "@/types.internal";
+import type { InternalScrollTarget, InternalState, MaintainVisibleContentPositionNormalized } from "@/types.internal";
 
 // This is an implementation of a simple state management system, inspired by Legend State.
 // It stores values and listeners in Maps, with peek$ and set$ functions to get and set values.
@@ -40,13 +42,16 @@ export type ListenerType =
     | "numContainersPooled"
     | "otherAxisSize"
     | "readyToRender"
+    | "isScrollActive"
     | "scrollAdjust"
     | "scrollAdjustPending"
     | "scrollAdjustUserOffset"
     | "scrollSize"
     | "snapToOffsets"
+    | "stickySettle"
     | "stylePaddingTop"
     | "totalSize"
+    | "isFollowingEnd"
     | "isAtEnd"
     | "isAtStart"
     | "isNearEnd"
@@ -68,6 +73,7 @@ export type LegendListListenerType = Extract<
     | "anchoredEndSpaceSize"
     | "footerSize"
     | "headerSize"
+    | "isFollowingEnd"
     | "isAtEnd"
     | "isAtStart"
     | "isNearEnd"
@@ -95,6 +101,7 @@ export type ListenerTypeValueMap = {
     extraData: any;
     footerSize: number;
     headerSize: number;
+    isFollowingEnd: boolean;
     isAtEnd: boolean;
     isAtStart: boolean;
     isNearEnd: boolean;
@@ -108,11 +115,13 @@ export type ListenerTypeValueMap = {
     numContainersPooled: number;
     otherAxisSize: number;
     readyToRender: boolean;
+    isScrollActive: boolean;
     scrollAdjust: number;
     scrollAdjustPending: number;
     scrollAdjustUserOffset: number;
     scrollSize: { width: number; height: number };
     snapToOffsets: number[];
+    stickySettle: number;
     stylePaddingTop: number;
     totalSize: number;
     adaptiveRender: "normal" | "light";
@@ -154,6 +163,12 @@ export interface StateContext {
             start: number;
             startBuffered: number;
             viewableItems: ViewToken[];
+            // minimumViewTime tracking: when each currently visible key became visible,
+            // plus the latest pair, scroll size and deadline for the single pending timer.
+            deadline?: number;
+            pair?: ViewabilityConfigCallbackPair<any>;
+            scrollSize?: number;
+            since?: Map<string, number>;
         }
     >;
     pendingContainerIds: Set<number> | null | undefined;
@@ -161,6 +176,12 @@ export interface StateContext {
     state: InternalState;
     scrollAxisGap: number;
     scrollRequestTracker?: ScrollRequestTracker;
+    clearTemporaryScrollAdjust?: () => void;
+    // Late-bound by LegendList so lower-level scroll modules can call back up without import cycles.
+    doMaintainScrollAtEnd?: () => boolean;
+    doScrollTo?: (params: DoScrollToParams) => void;
+    interruptUserScroll?: () => void;
+    scrollTo?: (params: InternalScrollTarget) => void;
     scrollToEnd?: (options?: ScrollToEndOptions) => boolean;
     values: Map<ListenerType, any>;
     viewRefs: Map<number, React.RefObject<LooseView | null>>;
@@ -297,10 +318,14 @@ export function peek$<T extends ListenerType>(
     return values.get(signalName);
 }
 
+// Listeners that set$ collects instead of calling, so the caller can call each one once.
+export type DeferredListeners = Map<(value: any) => void, any>;
+
 export function set$<T extends ListenerType>(
     ctx: StateContext,
     signalName: T,
     value: ListenerTypeValueMap[T] | undefined,
+    deferred?: DeferredListeners,
 ) {
     const { listeners, values } = ctx;
     if (values.get(signalName) !== value) {
@@ -308,7 +333,11 @@ export function set$<T extends ListenerType>(
         const setListeners = listeners.get(signalName);
         if (setListeners) {
             for (const listener of setListeners) {
-                listener(value);
+                if (deferred) {
+                    deferred.set(listener, value);
+                } else {
+                    listener(value);
+                }
             }
         }
     }

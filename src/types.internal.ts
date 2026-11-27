@@ -9,6 +9,7 @@ import type {
     Insets,
     LayoutRectangle,
     LegendListPropsBase,
+    LegendListRef,
     LegendListRenderItemProps,
     NativeScrollEvent,
     NativeSyntheticEvent,
@@ -22,7 +23,7 @@ import type { DrawDistanceMode } from "@/utils/getEffectiveDrawDistance";
 
 export type { BaseScrollViewProps, LegendListPropsBase } from "@/types.base";
 
-export type ScrollAdjustmentSource = "data" | "item-size";
+export type ScrollAdjustmentSource = "data" | "item-size" | "layout";
 
 export interface ScrollEventTargetLike {
     addEventListener(type: string, listener: (...args: any[]) => void): void;
@@ -50,6 +51,7 @@ export interface LegendListScrollerRef {
 }
 
 export interface MaintainVisibleContentPositionNormalized<ItemT = any> {
+    autoscrollToTopThreshold?: number;
     data: boolean;
     size: boolean;
     shouldRestorePosition?: (item: ItemT, index: number, data: readonly ItemT[]) => boolean;
@@ -59,23 +61,30 @@ export interface MaintainScrollAtEndNormalized {
     animated: boolean;
     onLayout: boolean;
     onItemLayout: boolean;
-    onDataChange: boolean;
+    onDataChange: boolean | "append";
     onFooterLayout: boolean;
 }
 
 export interface ThresholdSnapshot {
-    scrollPosition: number;
-    contentSize?: number;
+    scroll: number;
+    contentSize: number;
+    data: readonly unknown[];
     dataLength?: number;
-    atThreshold: boolean;
+    didRearmForData?: boolean;
+    isRequestPending?: boolean;
 }
 
 export type MaintainingScrollAtEndState = "pending-instant" | "pending-animated" | "instant" | "animated";
 
+export type ScrollResolve = () => void;
+
 export interface ScrollTarget {
     averageSizeSnapshot?: Record<string, number>;
     animated?: boolean;
+    /** Absolute and end targets include the contentContainerStyle minimum; item targets align to rows. */
+    clampToContentContainerMinSize?: boolean;
     index?: number;
+    key?: string;
     isInitialScroll?: boolean;
     itemSize?: number;
     offset: number;
@@ -98,8 +107,12 @@ type BootstrapInitialScrollSession = {
     visibleIndices?: readonly number[];
 };
 
-type InternalScrollTarget = ScrollTarget & {
+export type InternalScrollTarget = ScrollTarget & {
     isScrollToEnd?: boolean;
+    /** Web retries reissued after an animated scroll settled short of its recomputed target. */
+    landingRetries?: number;
+    /** Offset the latest landing retry started from, used to stop when the scroll makes no progress. */
+    landingRetryFrom?: number;
     waitForInitialScrollCompletionFrame?: boolean;
 };
 
@@ -160,8 +173,30 @@ export type AverageSizes = Record<string, { num: number; avg: number }>;
 
 export type AnchoredEndSpaceOwner = "list" | "scroll";
 
+/**
+ * Wraps the native content extent of a vertical list so an integration can publish its shrink on
+ * its own commit path. Horizontal lists aren't wrapped.
+ */
+export interface ContentExtentComponentInternalProps {
+    children: React.ReactNode;
+    /** Extent React is committing, including the footer and gaps. */
+    committedSize: number;
+    contentAlignItems?: ViewStyle["alignItems"];
+    contentRowGap?: number;
+    footer?: React.ReactNode;
+}
+
+// Internal bridge for integrations, not part of the public list ref contract.
+// Keyboard integrations report occlusion separately from scroll-range insets.
+export interface LegendListInternalRef extends LegendListRef {
+    reportViewabilityInsetEndInternal?: (inset: number) => void;
+    reportContentInsetForScrollInternal?: LegendListRef["reportContentInset"];
+}
+
 export interface InternalState {
-    adjustingFromInitialMount?: number;
+    viewabilityInsetEnd?: number;
+    /** Adjustments requested before the list was ready, applied on the next frame or when it becomes ready. */
+    initialMountAdjusts?: Array<() => void>;
     anchoredEndSpacePendingReady?: boolean;
     anchoredEndSpaceReadyAnchorIndex?: number;
     anchoredEndSpaceReadyAnchorKey?: string;
@@ -180,11 +215,14 @@ export interface InternalState {
     didColumnsChange?: boolean;
     didDataChange?: boolean;
     didFinishInitialScroll?: boolean;
+    didFullDrawDistancePrewarm?: boolean;
+    drawDistanceLimit?: number;
     didLoad?: boolean;
     didMeasureHeader?: boolean;
     didContainersLayout?: boolean;
     enableScrollForNextCalculateItemsInView: boolean;
-    edgeReachedGate?: "closed" | "prepared";
+    edgeReachedGate?: "closed" | "prepared" | "consumed-start" | "consumed-end";
+    edgeReachedGateScroll?: number;
     endBuffered: number;
     endNoBuffer: number;
     endReachedSnapshot: ThresholdSnapshot | undefined;
@@ -192,6 +230,7 @@ export interface InternalState {
     preservedEndAnchorCorrection?: {
         lastRequestTime?: number;
     };
+    hasEstimatedInitialLayout?: boolean;
     hasHadNonEmptyData: boolean;
     hasScrolled?: boolean;
     idCache: string[];
@@ -199,6 +238,7 @@ export interface InternalState {
     ignoreScrollFromMVCP?: { lt?: number; gt?: number };
     ignoreScrollFromMVCPIgnored?: boolean;
     indexByKey: Map<string, number>;
+    previousIndexByKey?: Map<string, number>;
     clearPreservedInitialScrollOnNextFinish?: boolean;
     initialScrollSession?: InternalInitialScrollSession;
     initialScroll: InternalInitialScrollTarget | undefined;
@@ -206,14 +246,33 @@ export interface InternalState {
     isEndReached: boolean | null;
     isFirst?: boolean;
     isStartReached: boolean | null;
+    isUnmounted?: boolean;
     lastBatchingAction: number;
     lastLayout: LayoutRectangle | undefined;
     lastFirstVisibleItemCallback?: { index: number; key: string };
     lastNativeScroll?: number;
     lastNativeScrollTime?: number;
+    nativeScrollGeometry?: { content: number; length: number };
+    accessibilityScrollEvent?: {
+        scroll: number;
+        content: number;
+        length: number;
+        adjust: number;
+        time?: number;
+        blocked: boolean;
+        direction: number;
+    };
     lastScrollAdjustForHistory?: number;
     lastScrollDelta: number;
     loadStartTime: number;
+    pendingEndMeasurements?: Set<string>;
+    isMomentumScrolling?: boolean;
+    // Content size at release while a user gesture awaits settlement.
+    userScrollContentSize?: number;
+    layoutAdjustmentEpoch?: number;
+    endFollowInterrupted?: boolean;
+    visibleContentAnchor?: { key: string; offset: number; sizeOnly?: true };
+    measuringContainersInLayout?: boolean;
     maintainingScrollAtEnd?: MaintainingScrollAtEndState;
     positionRecalculationStartIndex: number | undefined;
     mvcpAnchorLock?: {
@@ -237,19 +296,20 @@ export interface InternalState {
     pendingDataComparison?: PendingDataComparison;
     pendingScrollToEnd?: {
         options?: ScrollToEndOptions;
-        resolve: () => void;
         token: number;
     };
     pendingTotalSize?: number;
-    pendingScrollResolve?: (() => void) | undefined;
+    pendingScrollResolve?: ScrollResolve | undefined;
     runPendingScrollToEnd?: () => void;
     positions: Array<number | undefined>;
     positionsAreCurrent?: boolean;
+    containerSyncAdjust?: number;
     previousData?: readonly unknown[];
     queuedCalculateItemsInView: number | undefined;
     queuedInitialLayout?: boolean | undefined;
     reprocessCurrentScroll?: () => void;
     refScroller: React.RefObject<LegendListScrollerRef | null>;
+    renderRangeProjectionSettleAt?: number;
     scroll: number;
     scrollAdjustHandler: ScrollAdjustHandler;
     scrollForNextCalculateItemsInView: { top: number | null; bottom: number | null } | undefined;
@@ -268,6 +328,7 @@ export interface InternalState {
     scheduledWork: ScheduledWork;
     sizes: Map<string, number>;
     sizesKnown: Map<string, number>;
+    fixedItemSizeKeys?: Set<string>;
     startBuffered: number;
     startBufferedId?: string;
     startNoBuffer: number;
@@ -294,8 +355,11 @@ export interface InternalState {
         animatedProps: StylesAsSharedValue<Record<string, any>>;
         anchoredEndSpace: AnchoredEndSpaceConfig | undefined;
         anchoredEndSpaceOwner: AnchoredEndSpaceOwner;
+        /** Provided by integrations that apply end space outside React. */
+        contentExtentComponentInternal?: React.ComponentType<ContentExtentComponentInternalProps>;
         alwaysRender: AlwaysRenderConfig | undefined;
         contentContainerAlignItems: ViewStyle["alignItems"] | undefined;
+        contentContainerMinSize?: number;
         alwaysRenderIndicesArr: number[];
         alwaysRenderIndicesSet: Set<number>;
         contentInset: Insets | undefined;
@@ -307,6 +371,7 @@ export interface InternalState {
         estimatedItemSize: number | undefined;
         getFixedItemSize: LegendListPropsInternal["getFixedItemSize"];
         getItemType: LegendListPropsInternal["getItemType"];
+        hasItemLayoutAnimationInternal?: boolean;
         hideItemsUntilMeasured: LegendListPropsInternal["experimental_hideItemsUntilMeasured"];
         horizontal: boolean;
         rtl?: boolean;
@@ -322,7 +387,10 @@ export interface InternalState {
         onItemSizeChanged: LegendListPropsInternal["onItemSizeChanged"];
         onLoad: LegendListPropsInternal["onLoad"];
         onReady: LegendListPropsInternal["onReady"];
+        onMomentumScrollBegin: LegendListPropsInternal["onMomentumScrollBegin"];
         onMomentumScrollEnd: LegendListPropsInternal["onMomentumScrollEnd"];
+        onMetricsChange: LegendListPropsInternal["onMetricsChange"];
+        onUserScroll: LegendListPropsInternal["onUserScroll"];
         onScroll: LegendListPropsInternal["onScroll"];
         onScrollBeginDrag: LegendListPropsInternal["onScrollBeginDrag"];
         onScrollEndDrag: LegendListPropsInternal["onScrollEndDrag"];
@@ -356,8 +424,17 @@ export interface ViewableRange<T> {
     startBuffered: number;
 }
 
-export type GetRenderedItemResult<ItemT> = { index: number; item: ItemT; renderedItem: React.ReactNode };
-export type GetRenderedItem = (key: string, containerId: number) => GetRenderedItemResult<any> | null;
+export type GetRenderedItemResult<ItemT> = {
+    index: number;
+    item: ItemT;
+    renderedItem: React.ReactNode;
+    type?: string;
+};
+export type GetRenderedItem = (
+    key: string,
+    containerId: number,
+    onReadIndex?: () => void,
+) => GetRenderedItemResult<any> | null;
 
 // biome-ignore lint/complexity/noBannedTypes: This is correct
 export type TypedForwardRef = <T, P = {}>(

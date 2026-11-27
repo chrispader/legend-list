@@ -5,6 +5,7 @@ import { Platform } from "@/platform/Platform";
 import { prepareMVCP } from "../../src/core/mvcp";
 import type { StateContext } from "../../src/state/state";
 import type { InternalState } from "../../src/types.internal";
+import { normalizeMaintainScrollAtEnd } from "../../src/utils/normalizeMaintainScrollAtEnd";
 import { normalizeMaintainVisibleContentPosition } from "../../src/utils/normalizeMaintainVisibleContentPosition";
 import * as requestAdjustModule from "../../src/utils/requestAdjust";
 import { createMockContext } from "../__mocks__/createMockContext";
@@ -174,6 +175,67 @@ describe("prepareMVCP", () => {
             expect(requestAdjustSpy).not.toHaveBeenCalled();
         });
 
+        for (const maintaining of [undefined, "pending-animated", "animated"] as const) {
+            for (const withinThreshold of [true, false]) {
+                it(`leaves web animated end following in charge (${maintaining}, threshold: ${withinThreshold})`, () => {
+                    withWebPlatform(() => {
+                        mockState.props.maintainScrollAtEnd = {
+                            animated: true,
+                            onDataChange: true,
+                            onFooterLayout: false,
+                            onItemLayout: true,
+                            onLayout: true,
+                        };
+                        mockState.maintainingScrollAtEnd = maintaining;
+                        mockCtx.values.set("isFollowingEnd", true);
+                        mockCtx.values.set("isWithinMaintainScrollAtEndThreshold", withinThreshold);
+
+                        const restore = expectAdjustFunction(prepareMVCP(mockCtx, false, "item-size"));
+                        setLayoutValue(mockState, "positions", "item-1", 150);
+                        restore();
+                        expect(requestAdjustSpy).not.toHaveBeenCalled();
+
+                        // The reader interrupts following; later growth preserves their visible anchor.
+                        mockCtx.interruptUserScroll!();
+                        const restoreAway = expectAdjustFunction(prepareMVCP(mockCtx, false, "item-size"));
+                        setLayoutValue(mockState, "positions", "item-1", 200);
+                        restoreAway();
+                        expect(requestAdjustSpy).toHaveBeenCalledWith(mockCtx, 50, "item-size");
+                    });
+                });
+            }
+        }
+
+        for (const trigger of ["disabled data", "append-only prepend", "disabled item layout"] as const) {
+            it(`preserves the web anchor when animated end following excludes ${trigger}`, () => {
+                withWebPlatform(() => {
+                    mockState.props.maintainVisibleContentPosition = normalizeMaintainVisibleContentPosition(true);
+                    mockState.props.maintainScrollAtEnd = {
+                        animated: true,
+                        onDataChange: trigger === "append-only prepend" ? "append" : false,
+                        onFooterLayout: false,
+                        onItemLayout: false,
+                        onLayout: false,
+                    };
+                    mockState.props.maintainScrollAtEnd!.onDataChange =
+                        trigger === "append-only prepend" ? "append" : false;
+                    mockState.props.maintainScrollAtEnd!.onItemLayout = false;
+                    mockState.previousData = mockState.props.data;
+                    mockCtx.values.set("isFollowingEnd", true);
+                    mockCtx.values.set("isWithinMaintainScrollAtEndThreshold", false);
+
+                    const dataChanged = trigger !== "disabled item layout";
+                    const restore = expectAdjustFunction(
+                        prepareMVCP(mockCtx, dataChanged, dataChanged ? undefined : "item-size"),
+                    );
+                    setLayoutValue(mockState, "positions", "item-1", 150);
+                    restore();
+
+                    expect(requestAdjustSpy).toHaveBeenCalledWith(mockCtx, 50, dataChanged ? "data" : "item-size");
+                });
+            });
+        }
+
         it("should still adjust while an instant maintainScrollAtEnd is pending at the end", () => {
             mockState.props.maintainVisibleContentPosition = normalizeMaintainVisibleContentPosition(undefined);
             mockState.maintainingScrollAtEnd = "pending-instant";
@@ -214,6 +276,183 @@ describe("prepareMVCP", () => {
             adjustFunction();
 
             expect(requestAdjustSpy).toHaveBeenCalledWith(mockCtx, 50, undefined);
+        });
+
+        describe("instant end following on a data change", () => {
+            const followEnd = (platform: "ios" | "android" | "web") => {
+                Platform.OS = platform;
+                mockState.props.maintainVisibleContentPosition = normalizeMaintainVisibleContentPosition(true);
+                mockState.props.maintainScrollAtEnd = normalizeMaintainScrollAtEnd(true);
+                mockCtx.values.set("isFollowingEnd", true);
+                mockState.previousData = mockState.props.data;
+                mockState.totalSize = 730;
+                mockState.scroll = mockState.scrollPending = 230;
+            };
+            const trimFront = (delta: number) => {
+                mockState.props.data = mockState.props.data.slice(1);
+                mockState.idCache.shift();
+                mockState.indexByKey.clear();
+                mockState.idCache.forEach((id, index) => mockState.indexByKey.set(id, index));
+                mockState.positions.shift();
+                for (let i = 0; i < mockState.positions.length; i++)
+                    mockState.positions[i] = mockState.positions[i]! - 100;
+                mockState.totalSize += delta;
+            };
+
+            for (const platform of ["ios", "android", "web"] as const) {
+                it(`keeps a shrinking end without a backward anchor adjustment (${platform})`, () => {
+                    followEnd(platform);
+                    const restore = expectAdjustFunction(prepareMVCP(mockCtx, true));
+                    trimFront(-20);
+                    restore();
+
+                    expect(mockState.scroll).toBe(210);
+                    expect(mockState.scrollPending).toBe(210);
+                    expect(mockState.pendingNativeMVCPAdjust).toBeUndefined();
+                    expect(requestAdjustSpy).not.toHaveBeenCalled();
+                });
+
+                it(`targets the growing end instead of the trimmed row anchor (${platform})`, () => {
+                    followEnd(platform);
+                    const restore = expectAdjustFunction(prepareMVCP(mockCtx, true));
+                    trimFront(80);
+                    restore();
+
+                    expect(mockState.scroll).toBe(310);
+                    expect(mockState.pendingNativeMVCPAdjust).toBeUndefined();
+                    expect(requestAdjustSpy).toHaveBeenCalledWith(mockCtx, 80, "data");
+                });
+
+                for (const reason of ["disabled", "append-only", "reading older content"] as const) {
+                    it(`preserves the row anchor when data following is ${reason} (${platform})`, () => {
+                        followEnd(platform);
+                        if (reason === "reading older content") {
+                            mockCtx.values.set("isFollowingEnd", false);
+                        } else {
+                            mockState.props.maintainScrollAtEnd!.onDataChange =
+                                reason === "disabled" ? false : "append";
+                        }
+                        const restore = expectAdjustFunction(prepareMVCP(mockCtx, true));
+                        trimFront(80);
+                        restore();
+
+                        if (platform === "web") {
+                            expect(mockState.scroll).toBe(130);
+                            expect(requestAdjustSpy).toHaveBeenCalledWith(mockCtx, -100, "data");
+                        } else {
+                            expect(mockState.pendingNativeMVCPAdjust?.amount).toBe(-100);
+                            expect(requestAdjustSpy).not.toHaveBeenCalled();
+                        }
+                    });
+                }
+            }
+        });
+
+        describe("instant end following on a size-only change", () => {
+            // Content is 730 tall in a 500 viewport, so the end is 230. item-1 is the MVCP anchor
+            // and item-3 sits below it, so resizing item-3 leaves the anchor diff at 0.
+            const followEnd = () => {
+                mockState.props.maintainScrollAtEnd = normalizeMaintainScrollAtEnd(true);
+                mockCtx.values.set("isFollowingEnd", true);
+                mockState.totalSize = 730;
+                mockState.scroll = mockState.scrollPending = 230;
+            };
+            const resizeItem3 = (delta: number) => {
+                setLayoutValue(mockState, "positions", "item-4", 550 + delta);
+                mockState.totalSize = 730 + delta;
+            };
+
+            for (const platform of ["ios", "web"] as const) {
+                for (const source of ["item-size", "layout"] as const) {
+                    it(`lands growth at the end in the same pass (${source}, ${platform})`, () => {
+                        Platform.OS = platform;
+                        followEnd();
+                        const restore = expectAdjustFunction(prepareMVCP(mockCtx, false, source));
+                        resizeItem3(80);
+                        restore();
+
+                        expect(requestAdjustSpy).toHaveBeenCalledTimes(1);
+                        expect(requestAdjustSpy).toHaveBeenCalledWith(mockCtx, 80, source);
+                    });
+                }
+
+                it(`keeps a shrink at the new end without a scroll command (${platform})`, () => {
+                    Platform.OS = platform;
+                    followEnd();
+                    const restore = expectAdjustFunction(prepareMVCP(mockCtx, false, "item-size"));
+                    resizeItem3(-80);
+                    restore();
+
+                    expect(mockState.scroll).toBe(150);
+                    expect(mockState.scrollPending).toBe(150);
+                    expect(requestAdjustSpy).not.toHaveBeenCalled();
+                });
+            }
+
+            const cases: [string, () => void, ("item-size" | "layout")?][] = [
+                ["following was interrupted", () => mockCtx.interruptUserScroll!()],
+                [
+                    "item layout following is off",
+                    () => {
+                        mockState.props.maintainScrollAtEnd!.onItemLayout = false;
+                    },
+                ],
+                [
+                    "layout following is off",
+                    () => {
+                        mockState.props.maintainScrollAtEnd!.onLayout = false;
+                    },
+                    "layout",
+                ],
+                [
+                    "following is animated",
+                    () => {
+                        mockState.props.maintainScrollAtEnd!.animated = true;
+                    },
+                ],
+                [
+                    "following is paused",
+                    () => {
+                        mockState.props.maintainScrollAtEnd = undefined;
+                    },
+                ],
+                [
+                    "the reader is dragging",
+                    () => {
+                        mockState.isDragging = true;
+                    },
+                ],
+                [
+                    "an explicit anchor is set",
+                    () => {
+                        mockState.visibleContentAnchor = { key: "item-1", offset: 130 };
+                    },
+                ],
+            ];
+            for (const [name, setup, source = "item-size"] of cases) {
+                it(`keeps the normal anchor when ${name}`, () => {
+                    followEnd();
+                    setup();
+                    const restore = prepareMVCP(mockCtx, false, source);
+                    resizeItem3(80);
+                    restore?.();
+
+                    expect(requestAdjustSpy).not.toHaveBeenCalled();
+                    expect(mockState.scroll).toBe(230);
+                });
+            }
+
+            it("leaves a pending native MVCP adjust to finish on its own", () => {
+                followEnd();
+                mockState.pendingNativeMVCPAdjust = {
+                    amount: -40,
+                    furthestProgressTowardAmount: 0,
+                    manualApplied: 0,
+                    startScroll: 230,
+                };
+
+                expect(prepareMVCP(mockCtx, false, "item-size")).toBeUndefined();
+            });
         });
 
         it("should not adjust during regular scroll when maintainVisibleContentPosition is false", () => {
@@ -308,7 +547,6 @@ describe("prepareMVCP", () => {
             withWebPlatform(() => {
                 mockState.props.maintainVisibleContentPosition = normalizeMaintainVisibleContentPosition(true);
                 mockState.pendingScrollToEnd = {
-                    resolve: () => {},
                     token: 1,
                 };
                 mockState.mvcpAnchorLock = {
@@ -331,7 +569,6 @@ describe("prepareMVCP", () => {
         it("keeps native dataChanged adjustments while a scrollToEnd is pending", () => {
             mockState.props.maintainVisibleContentPosition = normalizeMaintainVisibleContentPosition(true);
             mockState.pendingScrollToEnd = {
-                resolve: () => {},
                 token: 1,
             };
 
@@ -985,7 +1222,7 @@ describe("prepareMVCP", () => {
             expect(requestAdjustSpy).toHaveBeenCalledWith(mockCtx, 50, undefined);
         });
 
-        it("should handle switching between scroll targets", () => {
+        it("ignores a prepared adjustment after switching scroll targets", () => {
             // First preparation with scroll target
             setScrollingTo({ animated: true, index: 2, offset: 0 });
             const adjust1 = expectAdjustFunction(prepareMVCP(mockCtx));
@@ -998,15 +1235,15 @@ describe("prepareMVCP", () => {
             setLayoutValue(mockState, "positions", "item-2", 300); // Original target
             setLayoutValue(mockState, "positions", "item-3", 500); // New target
 
-            adjust1(); // Should track item-2
-            adjust2(); // Should track item-3
+            adjust1();
+            expect(requestAdjustSpy).not.toHaveBeenCalled();
+            adjust2();
 
-            expect(requestAdjustSpy).toHaveBeenCalledTimes(2);
-            expect(requestAdjustSpy).toHaveBeenNthCalledWith(1, mockCtx, 50, undefined); // item-2: 300-250
-            expect(requestAdjustSpy).toHaveBeenNthCalledWith(2, mockCtx, 50, undefined); // item-3: 500-450
+            expect(requestAdjustSpy).toHaveBeenCalledTimes(1);
+            expect(requestAdjustSpy).toHaveBeenCalledWith(mockCtx, 50, undefined); // item-3: 500-450
         });
 
-        it("should handle changing from scrollingTo to visible items", () => {
+        it("ignores a prepared target adjustment after returning to visible items", () => {
             // First with scrollingTo
             setScrollingTo({ animated: true, index: 2, offset: 0 });
             const adjust1 = expectAdjustFunction(prepareMVCP(mockCtx));
@@ -1019,12 +1256,12 @@ describe("prepareMVCP", () => {
             setLayoutValue(mockState, "positions", "item-2", 300); // scroll target
             setLayoutValue(mockState, "positions", "item-1", 150); // first visible item
 
-            adjust1(); // Should track item-2
-            adjust2(); // Should track item-1
+            adjust1();
+            expect(requestAdjustSpy).not.toHaveBeenCalled();
+            adjust2();
 
-            expect(requestAdjustSpy).toHaveBeenCalledTimes(2);
-            expect(requestAdjustSpy).toHaveBeenNthCalledWith(1, mockCtx, 50, undefined); // item-2
-            expect(requestAdjustSpy).toHaveBeenNthCalledWith(2, mockCtx, 50, undefined); // item-1
+            expect(requestAdjustSpy).toHaveBeenCalledTimes(1);
+            expect(requestAdjustSpy).toHaveBeenCalledWith(mockCtx, 50, undefined); // item-1
         });
     });
 
@@ -1102,6 +1339,106 @@ describe("prepareMVCP", () => {
             adjustFunction();
 
             expect(requestAdjustSpy).not.toHaveBeenCalled();
+        });
+    });
+
+    describe("lists read from the bottom", () => {
+        const readFromBottom = () => {
+            mockState.props.alignItemsAtEnd = true;
+            mockState.props.maintainScrollAtEnd = normalizeMaintainScrollAtEnd(true);
+        };
+
+        it("keeps the last visible item in place when older rows load", () => {
+            withWebPlatform(() => {
+                readFromBottom();
+                mockState.props.maintainVisibleContentPosition = normalizeMaintainVisibleContentPosition({
+                    data: true,
+                });
+
+                const adjustFunction = expectAdjustFunction(prepareMVCP(mockCtx, true));
+
+                // Older rows load above and the first visible row loses its header, so the rows move by
+                // different amounts. The last visible row decides the adjustment.
+                setLayoutValue(mockState, "positions", "item-1", 300);
+                setLayoutValue(mockState, "positions", "item-2", 420);
+
+                adjustFunction();
+
+                expect(requestAdjustSpy).toHaveBeenCalledWith(mockCtx, 170, "data");
+            });
+        });
+
+        it("keeps the last visible item in place when older rows load during momentum", () => {
+            readFromBottom();
+            mockState.props.maintainVisibleContentPosition = normalizeMaintainVisibleContentPosition({ data: true });
+            mockState.isMomentumScrolling = true;
+            mockState.scroll = 180;
+
+            const adjustFunction = expectAdjustFunction(prepareMVCP(mockCtx, true));
+
+            setLayoutValue(mockState, "positions", "item-1", 300);
+            setLayoutValue(mockState, "positions", "item-2", 420);
+
+            adjustFunction();
+
+            expect(requestAdjustSpy).toHaveBeenCalledWith(mockCtx, 170, "data");
+        });
+
+        it("keeps the last visible item in place when a visible row resizes while idle", () => {
+            readFromBottom();
+            setScrollingTo(undefined);
+            mockState.idsInView = ["item-2", "item-3"];
+
+            const adjustFunction = expectAdjustFunction(prepareMVCP(mockCtx));
+
+            // item-2 shrinks, so only the item below it moves
+            setLayoutValue(mockState, "positions", "item-3", 400);
+
+            adjustFunction();
+
+            expect(requestAdjustSpy).toHaveBeenCalledWith(mockCtx, -50, undefined);
+        });
+
+        it("keeps the last visible item in place when a visible row resizes during momentum", () => {
+            readFromBottom();
+            setScrollingTo(undefined);
+            mockState.idsInView = ["item-2", "item-3"];
+            mockState.isMomentumScrolling = true;
+
+            const adjustFunction = expectAdjustFunction(prepareMVCP(mockCtx, undefined, "item-size"));
+
+            setLayoutValue(mockState, "positions", "item-3", 400);
+
+            adjustFunction();
+
+            expect(requestAdjustSpy).toHaveBeenCalledWith(mockCtx, -50, "item-size");
+        });
+
+        it("keeps the first visible item in place unless the list is aligned to and kept at its end", () => {
+            setScrollingTo(undefined);
+            mockState.idsInView = ["item-2", "item-3"];
+            for (const configure of [
+                () => {},
+                () => {
+                    mockState.props.alignItemsAtEnd = true;
+                },
+                () => {
+                    mockState.props.maintainScrollAtEnd = normalizeMaintainScrollAtEnd(true);
+                },
+            ]) {
+                mockState.props.alignItemsAtEnd = false;
+                mockState.props.maintainScrollAtEnd = undefined;
+                configure();
+                requestAdjustSpy.mockClear();
+
+                const adjustFunction = expectAdjustFunction(prepareMVCP(mockCtx));
+                setLayoutValue(mockState, "positions", "item-3", 400);
+                adjustFunction();
+                setLayoutValue(mockState, "positions", "item-3", 450);
+
+                // item-2 stays in place, so the shrink moves only the rows below it
+                expect(requestAdjustSpy).not.toHaveBeenCalled();
+            }
         });
     });
 });

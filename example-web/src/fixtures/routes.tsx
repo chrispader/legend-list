@@ -14,6 +14,7 @@ import ChatFloatingComposerExample from "./ChatFloatingComposerExample";
 import ColumnsExample from "./ColumnsExample";
 import CountriesExample from "./CountriesExample";
 import CountriesWithHeadersStickyExample from "./CountriesWithHeadersStickyExample";
+import DatasetSwitchExample from "./DatasetSwitchExample";
 import EndResizeExample from "./EndResizeExample";
 import ExternalScrollExample from "./ExternalScrollExample";
 import ExtraDataExample from "./ExtraDataExample";
@@ -26,7 +27,10 @@ import MutableCellsExample from "./MutableCellsExample";
 import MVCPTestExample from "./MVCPTestExample";
 import PrependLargeItemsJumpExample from "./PrependLargeItemsJumpExample";
 import RecycleImagePriorityExample from "./RecycleImagePriorityExample";
+import ScaledContainerExample from "./ScaledContainerExample";
+import ScrollPromiseLandedExample from "./ScrollPromiseLandedExample";
 import SnapToIndicesExample from "./SnapToIndicesExample";
+import ViewabilityDwellExample from "./ViewabilityDwellExample";
 import WindowScrollExample from "./WindowScrollExample";
 
 export type FixtureRoute = {
@@ -39,6 +43,23 @@ export type FixtureRoute = {
 };
 
 export const FIXTURE_ROUTES: FixtureRoute[] = [
+    {
+        description:
+            "Checks per-row dwell, pending callback/config replacement and data changes, with window, horizontal, columns and StrictMode options.",
+        element: () => <ViewabilityDwellExample />,
+        group: "Scroll & Position",
+        path: "viewability-dwell",
+        title: "Viewability Dwell",
+        usesWindowScroll: true,
+    },
+    {
+        description:
+            "Switches datasets in one mounted list with end, unread, and jump targets, tall rows, and late sizes.",
+        element: () => <DatasetSwitchExample />,
+        group: "Scroll & Position",
+        path: "dataset-switch",
+        title: "Dataset Switch",
+    },
     {
         description: "Two virtual lists share an ancestor scrollbar with dynamic content above them.",
         element: () => <ExternalScrollExample />,
@@ -74,6 +95,14 @@ export const FIXTURE_ROUTES: FixtureRoute[] = [
         group: "Scroll & Position",
         path: "accurate-scrollto",
         title: "Accurate ScrollTo",
+    },
+    {
+        description:
+            "Reports whether animated scrollToIndex/scrollToOffset promises resolve on the target while rows above measure late and renders stall.",
+        element: () => <ScrollPromiseLandedExample />,
+        group: "Scroll & Position",
+        path: "scroll-promise-landed",
+        title: "Scroll Promise Landed",
     },
     {
         description: "Stress-tests scrollTo accuracy deep into a very large dataset.",
@@ -179,6 +208,13 @@ export const FIXTURE_ROUTES: FixtureRoute[] = [
         group: "Data & Layout",
         path: "mutable-cells",
         title: "Mutable Cells",
+    },
+    {
+        description: "Measures rows inside a CSS-scaled ancestor by their layout size.",
+        element: () => <ScaledContainerExample />,
+        group: "Data & Layout",
+        path: "scaled-container",
+        title: "Scaled Container",
     },
     {
         description: "Regression surface for maintain-visible-content-position behavior.",

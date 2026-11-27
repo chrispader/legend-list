@@ -45,6 +45,11 @@ export const FIXTURE_SECTIONS: CatalogSection[] = [
                 title: "Accurate scrollTo Huge",
             },
             {
+                description: "Reports whether animated scroll promises resolve on the target while rows measure late.",
+                slug: "scroll-promise-landed",
+                title: "Scroll Promise Landed",
+            },
+            {
                 description: "Appends new rows while keeping the viewport stable at the end.",
                 slug: "add-to-end",
                 title: "Add to the End",
@@ -103,6 +108,11 @@ export const FIXTURE_SECTIONS: CatalogSection[] = [
                 description: "Updates cell state in place to confirm recycle safety.",
                 slug: "mutable-cells",
                 title: "Mutable Cells",
+            },
+            {
+                description: "Measures rows inside a CSS-scaled ancestor by their layout size.",
+                slug: "scaled-container",
+                title: "Scaled Container",
             },
             {
                 description: "Regression surface for maintain-visible-content-position behavior.",

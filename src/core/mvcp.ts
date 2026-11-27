@@ -1,5 +1,9 @@
 import { IsNewArchitecture } from "@/constants-platform";
 import { getViewPositionOffset } from "@/core/calculateOffsetWithOffsetPosition";
+import { getContentInsetTop, getScrollRangeEnd } from "@/core/clampScrollOffset";
+import { hasNativeScrollToStart } from "@/core/nativeScrollToStart";
+import { getObservedScrollOffset } from "@/core/observedScroll";
+import { shouldMaintainScrollAtEndOnDataChange } from "@/core/shouldMaintainScrollAtEndOnDataChange";
 import { Platform } from "@/platform/Platform";
 import { getContentInsetEnd } from "@/state/getContentInsetEnd";
 import { getContentSize } from "@/state/getContentSize";
@@ -108,12 +112,13 @@ function shouldQueueNativeMVCPAdjust(
     return distanceFromEnd < Math.abs(positionDiff) - MVCP_POSITION_EPSILON;
 }
 
-function getPredictedNativeClamp(state: StateContext["state"], unresolvedAmount: number, totalSize: number) {
+function getPredictedNativeClamp(ctx: StateContext, unresolvedAmount: number, totalSize: number) {
     if (Math.abs(unresolvedAmount) <= MVCP_POSITION_EPSILON) {
         return 0;
     }
 
-    const maxScroll = Math.max(0, totalSize - state.scrollLength);
+    const state = ctx.state;
+    const maxScroll = getScrollRangeEnd(ctx, totalSize);
     const clampDelta = maxScroll - state.scroll;
 
     if (unresolvedAmount < 0) {
@@ -149,7 +154,7 @@ function maybeApplyPredictedNativeMVCPAdjust(ctx: StateContext) {
     }
 
     const totalSize = getContentSize(ctx);
-    const predictedNativeClamp = getPredictedNativeClamp(state, pending.amount, totalSize);
+    const predictedNativeClamp = getPredictedNativeClamp(ctx, pending.amount, totalSize);
     if (Math.abs(predictedNativeClamp) <= MVCP_POSITION_EPSILON) {
         return;
     }
@@ -195,7 +200,7 @@ export function resolvePendingNativeMVCPAdjust(ctx: StateContext, newScroll: num
         return true;
     }
 
-    const expectedNativeClampScroll = Math.max(0, getContentSize(ctx) - state.scrollLength);
+    const expectedNativeClampScroll = getScrollRangeEnd(ctx);
     const distanceToClamp = Math.abs(newScroll - expectedNativeClampScroll);
     const isAtExpectedNativeClamp = distanceToClamp <= NATIVE_END_CLAMP_EPSILON;
 
@@ -237,13 +242,26 @@ export function prepareMVCP(
     const state = ctx.state;
     const { idsInView, positions, props } = state;
     const {
-        maintainVisibleContentPosition: { data: mvcpData, size: mvcpScroll, shouldRestorePosition },
+        maintainVisibleContentPosition: {
+            autoscrollToTopThreshold,
+            data: mvcpData,
+            size: mvcpScroll,
+            shouldRestorePosition,
+        },
     } = props;
     const isWeb = Platform.OS === "web";
+    // A list aligned to and kept at its end is read from the bottom, so the last visible item stays in place and
+    // changes move the content above it.
+    const anchorCandidateIds =
+        props.alignItemsAtEnd && props.maintainScrollAtEnd ? [...idsInView].reverse() : idsInView;
 
     const now = Date.now();
     const enableMVCPAnchorLock = isWeb && (!!dataChanged || !!state.mvcpAnchorLock);
     const scrollingTo = state.scrollingTo;
+    if (scrollingTo?.key !== undefined) {
+        const nextIndex = state.indexByKey.get(scrollingTo.key);
+        if (nextIndex !== undefined) scrollingTo.index = nextIndex;
+    }
     // A deferred scrollToEnd has not become state.scrollingTo yet. On web, data MVCP would otherwise
     // preserve the old visible anchor with an instant ScrollAdjust before the intended end scroll can animate.
     if (isWeb && dataChanged && state.pendingScrollToEnd && scrollingTo === undefined) {
@@ -264,8 +282,13 @@ export function prepareMVCP(
         scrollTarget >= state.props.data.length - 1 &&
         (scrollingToViewPosition ?? 0) > 0;
 
-    const shouldMVCP = dataChanged ? mvcpData : mvcpScroll;
+    if (dataChanged && state.visibleContentAnchor?.sizeOnly) {
+        state.visibleContentAnchor = undefined;
+    }
+    const explicitAnchor = state.visibleContentAnchor;
+    const shouldMVCP = !!explicitAnchor || (dataChanged ? mvcpData : mvcpScroll);
     const indexByKey = state.indexByKey;
+    const previousIndexByKey = dataChanged ? (state.previousIndexByKey ?? indexByKey) : indexByKey;
     const prevScroll = state.scroll;
     const prevTotalSize = getContentSize(ctx);
     if (shouldMVCP) {
@@ -276,7 +299,10 @@ export function prepareMVCP(
             return undefined;
         }
 
-        if (anchorLock && scrollTarget === undefined) {
+        if (explicitAnchor && scrollTarget === undefined) {
+            targetId = explicitAnchor.key;
+            prevPosition = state.scroll - explicitAnchor.offset;
+        } else if (anchorLock && scrollTarget === undefined) {
             targetId = anchorLock.id;
             prevPosition = anchorLock.position;
         } else if (scrollTarget !== undefined) {
@@ -286,17 +312,16 @@ export function prepareMVCP(
                 return undefined;
             }
             // If we're currently scrolling to a target index, do MVCP for its position
-            targetId = getId(state, scrollTarget);
+            targetId = scrollingTo?.key ?? getId(state, scrollTarget);
         } else if (idsInView.length > 0 && state.didContainersLayout && !dataChanged) {
-            // Do MVCP for the first item fully in view
-            targetId = idsInView.find((id) => indexByKey.get(id) !== undefined);
+            // Do MVCP for the first item fully in view, or the last one when read from the bottom
+            targetId = anchorCandidateIds.find((id) => indexByKey.get(id) !== undefined);
         }
 
         if (dataChanged && idsInView.length > 0 && state.didContainersLayout) {
             // Capture visible anchors for fallback in case the primary anchor disappears after data updates.
-            for (let i = 0; i < idsInView.length; i++) {
-                const id = idsInView[i];
-                const index = indexByKey.get(id);
+            for (const id of anchorCandidateIds) {
+                const index = previousIndexByKey.get(id);
                 if (index !== undefined) {
                     const position = positions[index];
                     if (position !== undefined) {
@@ -307,7 +332,7 @@ export function prepareMVCP(
         }
 
         if (targetId !== undefined && prevPosition === undefined) {
-            const targetIndex = indexByKey.get(targetId);
+            const targetIndex = previousIndexByKey.get(targetId);
             if (targetIndex !== undefined) {
                 prevPosition = positions[targetIndex];
             }
@@ -315,6 +340,10 @@ export function prepareMVCP(
 
         // Return a function to do MVCP based on the prepared values
         return () => {
+            // A keyed redispatch already accounts for the rebuilt target's position and alignment.
+            if (scrollTarget !== undefined && state.scrollingTo !== scrollingTo) {
+                return;
+            }
             let positionDiff = 0;
             let anchorIdForLock = anchorLock?.id;
             let anchorPositionForLock: number | undefined;
@@ -380,6 +409,7 @@ export function prepareMVCP(
                 const newPosition = targetIndex !== undefined ? positions[targetIndex] : undefined;
 
                 if (newPosition !== undefined) {
+                    if (scrollingTo?.key === targetId) scrollingTo.index = targetIndex;
                     const totalSize = getContentSize(ctx);
                     let diff = newPosition - prevPosition;
 
@@ -392,7 +422,7 @@ export function prepareMVCP(
                         } else {
                             // Content shrank while the end target was already past the new max scroll. Native will clamp
                             // to this value during layout, so keep JS state in sync and skip an extra MVCP anchor move.
-                            const maxScroll = Math.max(0, totalSize - state.scrollLength);
+                            const maxScroll = getScrollRangeEnd(ctx, totalSize);
                             state.scroll = maxScroll;
                             state.scrollPending = maxScroll;
                             diff = 0;
@@ -410,11 +440,13 @@ export function prepareMVCP(
                 scrollingToViewPosition !== undefined &&
                 (scrollingToViewPosition > 0 || scrollingTo.viewPositionFallback)
             ) {
-                const newSize = getItemSize(ctx, targetId!, scrollTarget!, state.props.data[scrollTarget!]);
+                const targetIndex = scrollingTo.index!;
+                // Position rebuilding can retarget an end request after targetId was captured.
+                const newSize = getItemSize(ctx, getId(state, targetIndex), targetIndex, state.props.data[targetIndex]);
                 const prevSize = scrollingTo.itemSize;
-                if (newSize !== undefined && prevSize !== undefined && newSize !== prevSize) {
+                if (prevSize !== undefined && newSize !== prevSize) {
                     if (scrollingTo.viewPositionFallback) {
-                        const viewport = state.scrollLength - getContentInsetEnd(ctx);
+                        const viewport = state.scrollLength - getContentInsetTop(ctx) - getContentInsetEnd(ctx);
                         const previousSpace = viewport - Math.max(0, prevSize - ctx.scrollAxisGap);
                         const nextSpace = viewport - Math.max(0, newSize - ctx.scrollAxisGap);
                         positionDiff +=
@@ -443,6 +475,45 @@ export function prepareMVCP(
                 positionDiff,
             });
 
+            // Instant end following owns the end, rather than the visible row anchor. An anchor adjustment
+            // would leave the list short of the end, or wait on native for a clamp that may never arrive.
+            const follow = state.props.maintainScrollAtEnd;
+            const shouldMaintainEnd =
+                follow &&
+                !follow.animated &&
+                (dataChanged
+                    ? shouldMaintainScrollAtEndOnDataChange(state)
+                    : adjustmentSource === "item-size"
+                      ? follow.onItemLayout
+                      : adjustmentSource === "layout" && follow.onLayout) &&
+                state.didFinishInitialScroll &&
+                !state.isDragging &&
+                state.userScrollContentSize === undefined &&
+                !state.visibleContentAnchor &&
+                !state.scrollingTo &&
+                !ctx.scrollRequestTracker?.isWaitingToRun() &&
+                peek$(ctx, "isFollowingEnd");
+            if (shouldMaintainEnd) {
+                const endOffset = getScrollRangeEnd(ctx);
+                if (state.scroll > endOffset) {
+                    // The platform clamps shrinking content to its new end; keep JS there without a command.
+                    state.scroll = endOffset;
+                    state.scrollPending = endOffset;
+                }
+                positionDiff = endOffset - state.scroll;
+            }
+
+            if (Platform.OS === "android" && !dataChanged && scrollTarget === undefined) {
+                const maxScroll = getScrollRangeEnd(ctx);
+                if (state.scroll > maxScroll + MVCP_POSITION_EPSILON) {
+                    // Android clamps shrinking content before native MVCP applies the anchor delta.
+                    const targetScroll = Math.max(0, Math.min(state.scroll + positionDiff, maxScroll));
+                    state.scroll = maxScroll;
+                    state.scrollPending = maxScroll;
+                    positionDiff = targetScroll - maxScroll;
+                }
+            }
+
             if (
                 shouldQueueNativeMVCPAdjust(dataChanged, state, positionDiff, prevTotalSize, prevScroll, scrollTarget)
             ) {
@@ -458,12 +529,45 @@ export function prepareMVCP(
 
             if (Math.abs(positionDiff) > MVCP_POSITION_EPSILON) {
                 const shouldSkipAdjustForMaintainedEnd =
-                    (state.maintainingScrollAtEnd === "pending-animated" ||
+                    ((state.maintainingScrollAtEnd === "pending-animated" ||
                         state.maintainingScrollAtEnd === "animated") &&
-                    peek$(ctx, "isWithinMaintainScrollAtEndThreshold");
+                        peek$(ctx, "isWithinMaintainScrollAtEndThreshold")) ||
+                    // Web following retains ownership between animation requests, even when
+                    // streaming growth moves the end beyond the threshold before the next frame.
+                    (isWeb &&
+                        props.maintainScrollAtEnd?.animated &&
+                        (state.pendingMaintainScrollAtEnd ||
+                            (dataChanged
+                                ? shouldMaintainScrollAtEndOnDataChange(state)
+                                : adjustmentSource === "item-size" && props.maintainScrollAtEnd.onItemLayout)) &&
+                        state.didFinishInitialScroll &&
+                        !state.endFollowInterrupted &&
+                        peek$(ctx, "isFollowingEnd") &&
+                        (!state.scrollingTo || state.scrollingTo.isScrollToEnd) &&
+                        !ctx.scrollRequestTracker?.isWaitingToRun());
 
                 if (!shouldSkipAdjustForMaintainedEnd) {
-                    requestAdjust(ctx, positionDiff, dataChanged && mvcpData ? "data" : adjustmentSource);
+                    const isDataAdjustment = dataChanged && mvcpData;
+                    const autoscrollToStart =
+                        isWeb &&
+                        isDataAdjustment &&
+                        autoscrollToTopThreshold !== undefined &&
+                        !shouldMaintainEnd &&
+                        !state.scrollingTo &&
+                        !hasNativeScrollToStart(ctx) &&
+                        state.refScroller.current?.isScrollInRange?.() !== false &&
+                        getObservedScrollOffset(ctx, prevScroll) <= autoscrollToTopThreshold;
+
+                    requestAdjust(ctx, positionDiff, isDataAdjustment ? "data" : adjustmentSource);
+
+                    if (autoscrollToStart) {
+                        state.scheduledWork.frame(() => {
+                            if (!state.scrollingTo && !state.pendingScrollToEnd && !hasNativeScrollToStart(ctx)) {
+                                state.mvcpAnchorLock = undefined;
+                                ctx.scrollTo!({ animated: true, offset: 0 });
+                            }
+                        }, "mvcpAutoscrollToStart");
+                    }
                 }
             }
         };

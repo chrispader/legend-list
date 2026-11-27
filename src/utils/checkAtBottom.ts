@@ -1,11 +1,10 @@
 import { EDGE_POSITION_EPSILON } from "@/constants";
-import { getContentInsetEnd } from "@/state/getContentInsetEnd";
 import { getContentSize } from "@/state/getContentSize";
-import { type StateContext, set$ } from "@/state/state";
+import { peek$, type StateContext, set$ } from "@/state/state";
 import { checkThreshold } from "@/utils/checkThreshold";
 import {
     canDispatchReachedEdge,
-    markReachedEdge,
+    dispatchReachedEdge,
     type ReachedEdge,
     resetSharedEdgeGateIfOutsideHysteresis,
 } from "@/utils/edgeReachedGate";
@@ -25,26 +24,41 @@ export function checkAtBottom(ctx: StateContext, allowedEdge?: ReachedEdge, allo
     } = state;
 
     const contentSize = getContentSize(ctx);
+    const distanceFromEnd = contentSize - scroll - scrollLength;
+    // Empty results can leave padding or other content at the end; estimates and alignment runway do not count.
+    const allowEmptyDataChange =
+        state.props.data.length === 0 &&
+        !!state.endReachedSnapshot?.dataLength &&
+        contentSize - (peek$(ctx, "alignItemsAtEndPadding") || 0) > (state.pendingTotalSize ?? state.totalSize);
     resetSharedEdgeGateIfOutsideHysteresis(ctx);
-    if (state.props.data.length === 0 && scrollLength > 0 && contentSize <= scrollLength) {
+    if (state.props.data.length === 0 && scrollLength > 0 && contentSize <= scrollLength && !allowEmptyDataChange) {
         set$(ctx, "isAtEnd", true);
         set$(ctx, "isNearEnd", true);
         set$(ctx, "isWithinMaintainScrollAtEndThreshold", true);
         return;
     }
     if (contentSize > 0 && queuedInitialLayout) {
-        const insetEnd = getContentInsetEnd(ctx);
-        const distanceFromEnd = contentSize - scroll - scrollLength - insetEnd;
         const isContentLess = contentSize < scrollLength;
-        set$(ctx, "isAtEnd", isContentLess || distanceFromEnd <= EDGE_POSITION_EPSILON);
+        const isAtEnd = isContentLess || distanceFromEnd <= EDGE_POSITION_EPSILON;
+        // Committed measurements can grow the extent before the queued follow scroll runs.
+        const deferEndExit =
+            !isAtEnd &&
+            state.measuringContainersInLayout &&
+            (maintainingScrollAtEnd === "pending-instant" || maintainingScrollAtEnd === "pending-animated") &&
+            !state.endFollowInterrupted &&
+            peek$(ctx, "isAtEnd");
+        if (!deferEndExit) set$(ctx, "isAtEnd", isAtEnd);
         set$(ctx, "isNearEnd", isContentLess || distanceFromEnd <= onEndReachedThreshold! * scrollLength);
         set$(
             ctx,
             "isWithinMaintainScrollAtEndThreshold",
             isContentLess ||
-                distanceFromEnd <= maintainScrollAtEndThreshold! * scrollLength ||
+                // A zero threshold still includes fractional offsets considered
+                // at the end; otherwise following can stop after rounding/layout.
+                distanceFromEnd <= Math.max(EDGE_POSITION_EPSILON, maintainScrollAtEndThreshold! * scrollLength) ||
                 state.pendingMaintainScrollAtEnd ||
-                !!maintainingScrollAtEnd,
+                !!maintainingScrollAtEnd ||
+                !!peek$(ctx, "isFollowingEnd"),
         );
 
         const shouldSkipThresholdChecks = hasActiveInitialScroll(state) || maintainingScrollAtEnd;
@@ -55,26 +69,21 @@ export function checkAtBottom(ctx: StateContext, allowedEdge?: ReachedEdge, allo
                 onEndReachedThreshold! * scrollLength,
                 state.isEndReached,
                 state.endReachedSnapshot,
-                {
-                    contentSize,
-                    dataLength: state.props.data?.length,
-                    scrollPosition: scroll,
-                },
+                { contentSize, data: state.props.data, dataLength: state.props.data.length, scroll },
                 (distance) => {
-                    let dispatched = false;
                     if (
                         state.props.onEndReached &&
                         canDispatchReachedEdge(ctx, "end", allowedEdge, allowGateCreatedInCurrentCheck)
                     ) {
-                        markReachedEdge(ctx);
-                        state.props.onEndReached({ distanceFromEnd: distance });
-                        dispatched = true;
+                        dispatchReachedEdge(ctx, "end", () => state.props.onEndReached!({ distanceFromEnd: distance }));
+                        return true;
                     }
-                    return dispatched;
+                    return false;
                 },
                 (snapshot) => {
                     state.endReachedSnapshot = snapshot;
                 },
+                allowEmptyDataChange,
             );
         }
     }

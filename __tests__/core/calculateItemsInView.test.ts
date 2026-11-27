@@ -1,8 +1,11 @@
 import { Platform } from "@/platform/Platform";
-import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, jest, mock, spyOn } from "bun:test";
 import { calculateItemsInView } from "../../src/core/calculateItemsInView";
+import { interruptUserScroll } from "../../src/core/cancelScroll";
+import { checkResetContainers } from "../../src/core/checkResetContainers";
 import { finishScrollTo } from "../../src/core/finishScrollTo";
 import * as mvcpModule from "../../src/core/mvcp";
+import { scrollTo } from "../../src/core/scrollTo";
 import * as updateItemPositionsModule from "../../src/core/updateItemPositions";
 import { updateScroll } from "../../src/core/updateScroll";
 import * as viewabilityModule from "../../src/core/viewability";
@@ -10,12 +13,15 @@ import type { StateContext } from "../../src/state/state";
 import type { InternalState } from "../../src/types.internal";
 import { getExpandedContainerPoolSize } from "../../src/utils/containerPool";
 import { getAlwaysRenderIndices } from "../../src/utils/getAlwaysRenderIndices";
+import { scheduleFullDrawDistancePrewarm } from "../../src/utils/getEffectiveDrawDistance";
+import { getId } from "../../src/utils/getId";
 import { getScrollVelocity } from "../../src/utils/getScrollVelocity";
 import { normalizeMaintainVisibleContentPosition } from "../../src/utils/normalizeMaintainVisibleContentPosition";
 import * as setDidLayoutModule from "../../src/utils/setDidLayout";
 import { resetInitialRenderState } from "../../src/utils/setInitialRenderState";
 import { createMockContext } from "../__mocks__/createMockContext";
 import { clearLayoutValues, countLayoutValues, setLayoutValue } from "../helpers/layoutArrays";
+import { installFakeClock } from "../helpers/webScrollHarness";
 
 describe("calculateItemsInView", () => {
     let mockCtx: StateContext;
@@ -80,6 +86,354 @@ describe("calculateItemsInView", () => {
         const start = performance.now();
         run();
         return performance.now() - start;
+    }
+
+    for (const platform of ["ios", "android", "web"] as const) {
+        it(`preserves slot ownership until loading-row and prepend positions commit on ${platform}`, () => {
+            const previousOS = Platform.OS;
+            Platform.OS = platform;
+            try {
+                const rows = Array.from({ length: 100 }, (_, i) => ({ id: `row-${i}` }));
+                mockState.props.data = rows;
+                mockState.props.keyExtractor = (item: { id: string }) => item.id;
+                mockState.props.getFixedItemSize = () => 50;
+                mockState.props.drawDistance = 100;
+                mockState.props.recycleItems = true;
+                mockState.props.maintainVisibleContentPosition = normalizeMaintainVisibleContentPosition(true);
+                mockState.scroll = 500;
+                mockState.scrollLength = 200;
+                mockState.didContainersLayout = true;
+                mockState.isFirst = false;
+                mockCtx.values.set("readyToRender", true);
+                calculateItemsInView(mockCtx, { dataChanged: true, scrollVelocity: 0 });
+
+                const slots = new Map(mockState.containerItemKeys);
+                const commitData = (data: typeof rows, expectedScroll: number) => {
+                    // LegendList refreshes key lookups during render so child measurements
+                    // see current indices; positions remain from the previous committed data.
+                    mockState.previousData = mockState.props.data;
+                    mockState.previousIndexByKey = mockState.indexByKey;
+                    mockState.props.data = data;
+                    mockState.didDataChange = true;
+                    mockState.indexByKey = new Map();
+                    mockState.idCache.length = data.length;
+                    for (let i = 0; i < data.length; i++) {
+                        mockState.indexByKey.set(getId(mockState, i), i);
+                    }
+                    const positions = [...mockState.positions];
+                    const idsInView = [...mockState.idsInView];
+
+                    // A child layout or queued scroll pass runs before the parent effect.
+                    for (const doMVCP of [false, true]) {
+                        calculateItemsInView(mockCtx, { doMVCP, scrollVelocity: 0 });
+                        expect(mockState.containerItemKeys).toEqual(slots);
+                        expect(mockState.positions).toEqual(positions);
+                        expect(mockState.idsInView).toEqual(idsInView);
+                    }
+
+                    checkResetContainers(mockCtx, data);
+                    mockState.didDataChange = false;
+                    mockState.previousIndexByKey = undefined;
+                    expect(mockState.scroll).toBe(expectedScroll);
+                    for (const [key, slot] of slots) {
+                        expect(mockState.containerItemKeys.get(key)).toBe(slot);
+                        expect(mockCtx.values.get(`containerItemIndex${slot}`)).toBe(
+                            data.findIndex((item) => item.id === key),
+                        );
+                    }
+                    calculateItemsInView(mockCtx, { doMVCP: true, scrollVelocity: 0 });
+                    for (const [key, slot] of slots) {
+                        expect(mockState.containerItemKeys.get(key)).toBe(slot);
+                    }
+                };
+
+                commitData([{ id: "loading" }, ...rows], 550);
+                commitData([...Array.from({ length: 50 }, (_, i) => ({ id: `older-${i}` })), ...rows], 3000);
+            } finally {
+                Platform.OS = previousOS;
+            }
+        });
+    }
+
+    it("resumes scrolling while Suspense keeps a prepend's layout effects pending", async () => {
+        const rows = Array.from({ length: 100 }, (_, i) => ({ id: `row-${i}` }));
+        mockState.props.data = rows;
+        mockState.props.keyExtractor = (item: { id: string }) => item.id;
+        mockState.props.getFixedItemSize = () => 50;
+        mockState.props.drawDistance = 100;
+        mockState.props.recycleItems = true;
+        mockState.props.maintainVisibleContentPosition = normalizeMaintainVisibleContentPosition(true);
+        mockState.scrollLength = 200;
+        mockState.didContainersLayout = true;
+        mockState.isFirst = false;
+        mockCtx.values.set("readyToRender", true);
+        calculateItemsInView(mockCtx, { dataChanged: true, scrollVelocity: 0 });
+
+        mockState.previousData = rows;
+        mockState.previousIndexByKey = mockState.indexByKey;
+        mockState.props.data = [{ id: "older" }, ...rows];
+        mockState.didDataChange = true;
+        mockState.indexByKey = new Map();
+        mockState.idCache.length = mockState.props.data.length;
+        for (let i = 0; i < mockState.props.data.length; i++) mockState.indexByKey.set(getId(mockState, i), i);
+        const positions = [...mockState.positions];
+        mockState.scroll = 2500;
+        calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+        expect(mockState.positions).toEqual(positions);
+
+        // A suspended parent never runs its data-change effect in this turn.
+        await Promise.resolve();
+        expect(mockState.containerItemKeys.has("row-50")).toBe(true);
+        expect(mockState.previousIndexByKey).toBe(mockState.indexByKey);
+        const scroll = mockState.scroll;
+        const slots = new Map(mockState.containerItemKeys);
+
+        // Reconnecting that effect must not apply the prepend adjustment twice.
+        checkResetContainers(mockCtx, mockState.props.data);
+        expect(mockState.scroll).toBe(scroll);
+        expect(mockState.containerItemKeys).toEqual(slots);
+    });
+
+    it("preserves newly appended slots if another pending render inserts before them", () => {
+        const rows = Array.from({ length: 10 }, (_, i) => ({ id: `row-${i}` }));
+        mockState.props.keyExtractor = (item: { id: string }) => item.id;
+        mockState.props.getFixedItemSize = () => 50;
+        mockState.props.drawDistance = 0;
+        mockState.props.recycleItems = true;
+        mockState.props.maintainVisibleContentPosition = normalizeMaintainVisibleContentPosition(true);
+        mockState.scrollLength = 100;
+        mockState.scroll = 400;
+        mockState.didContainersLayout = true;
+        mockState.isFirst = false;
+        mockCtx.values.set("readyToRender", true);
+
+        const publishData = (data: typeof rows) => {
+            mockState.previousData = mockState.props.data;
+            mockState.previousIndexByKey ??= mockState.indexByKey;
+            mockState.props.data = data;
+            mockState.didDataChange = true;
+            mockState.indexByKey = new Map();
+            mockState.idCache.length = data.length;
+            for (let i = 0; i < data.length; i++) mockState.indexByKey.set(getId(mockState, i), i);
+        };
+        mockState.props.data = rows;
+        calculateItemsInView(mockCtx, { dataChanged: true, scrollVelocity: 0 });
+
+        const appended = [{ id: "appended-a" }, { id: "appended-b" }];
+        publishData([...rows, ...appended]);
+        // The append can refresh content size even if the parent effects are hidden.
+        calculateItemsInView(mockCtx, { forceFullItemPositions: true, scrollVelocity: 0 });
+        expect(mockState.totalSize).toBe(600);
+        mockState.scroll = 500;
+        calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+        expect(mockState.idsInView).toEqual(appended.map((item) => item.id));
+        const slots = appended.map((item) => mockState.containerItemKeys.get(item.id));
+
+        publishData([...rows, { id: "loading" }, ...appended]);
+        calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+        expect(appended.map((item) => mockState.containerItemKeys.get(item.id))).toEqual(slots);
+        checkResetContainers(mockCtx, mockState.props.data);
+        expect(mockState.scroll).toBe(550);
+        expect(mockState.idsInView).toEqual(appended.map((item) => item.id));
+        expect(appended.map((item) => mockState.containerItemKeys.get(item.id))).toEqual(slots);
+    });
+
+    it.each([false, true])("uses horizontal start padding instead of top padding (rtl=%s)", (rtl) => {
+        setupFixedSizeItems(30, 10);
+        mockState.props.horizontal = true;
+        mockState.props.rtl = rtl;
+        mockState.props.stylePaddingLeft = 30;
+        mockState.props.stylePaddingRight = 70;
+        mockCtx.values.set("stylePaddingTop", 200);
+        mockCtx.values.set("headerSize", 133);
+        mockState.scrollLength = 10;
+        mockState.scroll = 133 + (rtl ? 70 : 30) + 100;
+        calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+        expect(mockState.startNoBuffer).toBe(10);
+        expect(mockState.endNoBuffer).toBe(11);
+    });
+
+    it("keeps the visible range at a reachable offset inside minHeight", () => {
+        setupFixedSizeItems(10, 35);
+        mockState.props.contentContainerMinSize = 861.667;
+        mockState.props.contentInset = { bottom: 86, left: 0, right: 0, top: 116 };
+        mockState.scrollLength = 874;
+        mockState.scroll = 73.667;
+        calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+        expect(mockState.startNoBuffer).toBe(2);
+        expect(mockState.idsInView[0]).toBe("item_2");
+    });
+
+    it.each(["ios", "android"])("keeps native RTL rows mounted inside a container minimum (%s)", (platform) => {
+        const previousOS = Platform.OS;
+        Platform.OS = platform as typeof Platform.OS;
+        try {
+            setupFixedSizeItems(100, 35);
+            mockState.props.horizontal = true;
+            mockState.props.rtl = true;
+            mockState.props.contentContainerMinSize = 5000;
+            mockState.props.contentInset = { bottom: 0, left: 86, right: 0, top: 0 };
+            mockState.scrollLength = 600;
+            mockState.scroll = 4400;
+            mockCtx.values.set("numContainers", 28);
+
+            calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+
+            const slot = mockState.containerItemKeys.get("item_90")!;
+            expect(slot).toBeDefined();
+            expect(mockCtx.values.get(`containerPosition${slot}`)).toBe(315);
+            expect(mockState.idsInView).toContain("item_90");
+            expect(mockState.scroll).toBe(4400);
+        } finally {
+            Platform.OS = previousOS;
+        }
+    });
+
+    it("preserves grouped fractional rounding and the pending adjustment for mounted rows", () => {
+        setupFixedSizeItems(30, 10);
+        mockState.scroll = 100.1;
+        mockState.scrollLength = 10;
+        mockCtx.values.set("stylePaddingTop", 0.7);
+        mockCtx.values.set("scrollAdjustPending", 0.1);
+
+        calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+
+        // Grouped: round(100.1 + (0.1 - 0.7)) = 100; left-associated = 99.
+        expect(mockState.startNoBuffer).toBe(10);
+        const slot = mockState.containerItemKeys.get("item_10")!;
+        expect(slot).toBeDefined();
+        expect(mockCtx.values.get(`containerPosition${slot}`)).toBe(99.9);
+    });
+
+    it("retains the start-padding snapshot when layout changes padding before an MVCP update", () => {
+        setupFixedSizeItems(30, 10);
+        mockState.scrollLength = 10;
+        mockCtx.values.set("alignItemsAtEndPadding", 20);
+        // Updating the stale total size clears alignment padding during this pass.
+        mockState.totalSize = 290;
+        const prepareMVCPSpy = spyOn(mvcpModule, "prepareMVCP").mockImplementation(() => () => {
+            mockState.scroll = 100;
+            mockCtx.values.set("scrollAdjustPending", 10);
+        });
+        try {
+            calculateItemsInView(mockCtx, { doMVCP: true, scrollVelocity: 0 });
+
+            expect(mockCtx.values.get("alignItemsAtEndPadding")).toBe(0);
+            expect(mockState.startNoBuffer).toBe(9);
+            const slot = mockState.containerItemKeys.get("item_9")!;
+            expect(slot).toBeDefined();
+            expect(mockCtx.values.get(`containerPosition${slot}`)).toBe(80);
+        } finally {
+            prepareMVCPSpy.mockRestore();
+        }
+    });
+
+    it("applies a deferred item-size MVCP correction in the next pass that repositions items", () => {
+        setupFixedSizeItems(30, 10);
+        const deferredPass = mock(() => {});
+        mockState.scheduledWork.frame(deferredPass, "mvcpRecalculate");
+        const prepareMVCPSpy = spyOn(mvcpModule, "prepareMVCP").mockImplementation(() => undefined);
+        try {
+            // A scroll-driven pass runs before the deferred frame.
+            calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+
+            expect(prepareMVCPSpy).toHaveBeenCalledWith(mockCtx, undefined, "item-size");
+            expect(mockState.scheduledWork.has("mvcpRecalculate")).toBe(false);
+        } finally {
+            prepareMVCPSpy.mockRestore();
+        }
+    });
+
+    it("limits cold assignments to the current buffer and header-corrected animated target union", () => {
+        setupFixedSizeItems(120, 64);
+        mockState.props.estimatedItemSize = 64;
+        mockState.props.recycleItems = true;
+        mockState.props.drawDistance = 250;
+        mockState.props.maintainVisibleContentPosition = false;
+        mockState.didFinishInitialScroll = true;
+        mockState.scrollLength = 812;
+        mockCtx.values.set("headerSize", 133);
+        mockCtx.values.set("numContainers", 15);
+        mockCtx.values.set("numContainersPooled", 45);
+        mockCtx.values.set("readyToRender", true);
+        mockState.enableScrollForNextCalculateItemsInView = false;
+        mockState.triggerCalculateItemsInView = () => calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+
+        const counts: number[] = [];
+        const activated = new Set<number>();
+        const record = () => {
+            for (let slot = 0; slot < mockCtx.values.get("numContainers"); slot++) {
+                if (mockCtx.values.get(`containerItemKey${slot}`) !== undefined) {
+                    activated.add(slot);
+                }
+            }
+            counts.push(activated.size);
+        };
+
+        calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+        record();
+        expect([mockState.startBuffered, mockState.endBuffered]).toEqual([0, 16]);
+        scrollTo(mockCtx, { animated: true, offset: 600 });
+        record();
+        expect([mockState.startBuffered, mockState.endBuffered]).toEqual([0, 16]);
+        expect(mockState.scrollTargetPinnedRange).toEqual({ end: 19, start: 7 });
+        // A deterministic frame during the first animation, before replacing its target.
+        mockState.scroll = mockState.scrollPending = 350;
+        calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+        record();
+        expect([mockState.startBuffered, mockState.endBuffered]).toEqual([1, 21]);
+        scrollTo(mockCtx, { animated: true, offset: 1200 });
+        record();
+
+        // At rest: item-space bottom 812 - 133 + 375 = 1054 => buffer 0..16 (17).
+        // Target600: [467,1279] intersects 7..19; union 0..19 needs 20 rows, 3 cold.
+        // Frame350: buffer [217-125,217+812+375] intersects 1..21 (21 rows).
+        // Target1200: [1067,1879] intersects 16..29; union 1..29 needs 29 rows.
+        // The latter union adds 9 cold slots since target600, including the intermediate frame.
+        expect([mockState.startBuffered, mockState.endBuffered]).toEqual([1, 21]);
+        expect(mockState.scrollTargetPinnedRange).toEqual({ end: 29, start: 16 });
+        expect(counts).toEqual([17, 20, 21, 29]);
+        for (let index = 1; index <= 29; index++) {
+            expect(mockState.containerItemKeys.has(`item_${index}`)).toBe(true);
+        }
+    });
+
+    for (const rtl of [false, true]) {
+        it(`keeps visible horizontal rows assigned when reusing warm slots (rtl=${rtl})`, () => {
+            setupFixedSizeItems(120, 64);
+            mockState.props.horizontal = true;
+            mockState.props.rtl = rtl;
+            mockState.props.stylePaddingLeft = rtl ? 17 : 600;
+            mockState.props.stylePaddingRight = rtl ? 600 : 17;
+            mockState.props.recycleItems = true;
+            mockState.props.drawDistance = 250;
+            mockState.props.maintainVisibleContentPosition = false;
+            mockState.didFinishInitialScroll = true;
+            mockState.scrollLength = 812;
+            mockCtx.values.set("headerSize", 133);
+            mockCtx.values.set("numContainers", 40);
+            mockCtx.values.set("numContainersPooled", 40);
+            mockCtx.values.set("readyToRender", true);
+            mockState.enableScrollForNextCalculateItemsInView = false;
+
+            calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+            const visibleSlots = Array.from({ length: 4 }, (_, index) =>
+                mockState.containerItemKeys.get(`item_${index + 4}`),
+            );
+            mockState.scroll = mockState.scrollPending = 1000;
+            calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+
+            // Native 1000 - header 133 - start padding 600 = item offset 267.
+            // Rows 4..16 are visible; already mounted rows 4..7 must keep their slots.
+            expect([mockState.startNoBuffer, mockState.endNoBuffer]).toEqual([4, 16]);
+            for (let index = 4; index <= 7; index++) {
+                expect(visibleSlots[index - 4]).toBeDefined();
+                expect(mockState.containerItemKeys.get(`item_${index}`)).toBe(visibleSlots[index - 4]);
+            }
+            for (let index = 4; index <= 16; index++) {
+                expect(mockState.containerItemKeys.has(`item_${index}`)).toBe(true);
+            }
+        });
     }
 
     describe("external scroll viewport", () => {
@@ -680,6 +1034,62 @@ describe("calculateItemsInView", () => {
     });
 
     describe("scroll buffer handling", () => {
+        for (const os of ["ios", "web"] as const) {
+            it.each([
+                [0, 0, 13, 10],
+                [0, 600, 7, 4],
+                [600, 0, 17, 16],
+            ])(
+                `keeps ${os} mounts within the directional buffer budget (scroll=%s, header=%s)`,
+                (scroll, header, end, visibleEnd) => {
+                    spyOn(Platform, "OS", "get").mockReturnValue(os);
+                    setupFixedSizeItems(100, 100);
+                    mockState.props.drawDistance = 250;
+                    mockState.scroll = scroll;
+                    mockCtx.values.set("headerSize", header);
+                    mockCtx.values.set("readyToRender", true);
+
+                    calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+
+                    expect(mockState.endNoBuffer).toBe(visibleEnd);
+                    expect(mockState.endBuffered).toBe(end);
+                    expect(getRenderedContainerKeys()).toHaveLength(end - mockState.startBuffered + 1);
+                },
+            );
+        }
+
+        for (const os of ["ios", "web"] as const) {
+            it(`${os} widens the range near the top on the prewarm pass, not at first paint`, () => {
+                spyOn(Platform, "OS", "get").mockReturnValue(os);
+                setupFixedSizeItems(100, 100);
+                mockState.props.drawDistance = 250;
+                mockState.props.estimatedItemSize = 100;
+                mockState.triggerCalculateItemsInView = () => calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+                const clock = installFakeClock();
+                try {
+                    mockCtx.values.set("readyToRender", true);
+                    scheduleFullDrawDistancePrewarm(mockCtx);
+                    calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+                    expect(mockState.endBuffered).toBe(13);
+
+                    clock.advance(100);
+                    expect(mockState.endBuffered).toBe(16);
+
+                    mockState.scroll = 600;
+                    calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+                    expect(mockState.endBuffered).toBe(17);
+
+                    resetInitialRenderState(mockCtx, {});
+                    mockCtx.values.set("readyToRender", true);
+                    mockState.scroll = 0;
+                    calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+                    expect(mockState.endBuffered).toBe(13);
+                } finally {
+                    clock.restore();
+                }
+            });
+        }
+
         it("should include buffered items beyond visible area", () => {
             mockState.props.data = Array.from({ length: 20 }, (_, i) => ({ id: i }));
             mockState.scroll = 200; // Scroll to middle
@@ -767,6 +1177,46 @@ describe("calculateItemsInView", () => {
             expect(mockState.endBuffered).toBe(6);
         });
 
+        it("keeps one projection timer pending until scrolling settles", () => {
+            setupFixedSizeItems(20, 100);
+            mockCtx.values.set("readyToRender", true);
+            mockState.props.drawDistance = 100;
+            mockState.scroll = 300;
+            mockState.scrollLength = 300;
+            const recalculate = mock();
+            mockState.triggerCalculateItemsInView = recalculate;
+            mockState.scrollHistory = [{ scroll: 300, time: Date.now() }];
+
+            jest.useFakeTimers();
+            const setTimer = spyOn(globalThis, "setTimeout");
+            const clearTimer = spyOn(globalThis, "clearTimeout");
+            try {
+                calculateItemsInView(mockCtx, { scrollVelocity: 4 });
+                for (let i = 0; i < 5; i++) {
+                    jest.advanceTimersByTime(16);
+                    calculateItemsInView(mockCtx, { scrollVelocity: 4 });
+                }
+
+                expect(setTimer).toHaveBeenCalledTimes(1);
+                expect(clearTimer).not.toHaveBeenCalled();
+                jest.advanceTimersByTime(20);
+                expect(setTimer).toHaveBeenCalledTimes(2);
+                expect(recalculate).not.toHaveBeenCalled();
+
+                jest.advanceTimersByTime(79);
+                expect(recalculate).not.toHaveBeenCalled();
+                jest.advanceTimersByTime(1);
+                expect(recalculate).toHaveBeenCalledTimes(1);
+                expect(mockState.scrollHistory).toHaveLength(0);
+                expect(mockState.scheduledWork.has("renderRangeProjection")).toBe(false);
+            } finally {
+                mockState.scheduledWork.dispose();
+                setTimer.mockRestore();
+                clearTimer.mockRestore();
+                jest.useRealTimers();
+            }
+        });
+
         for (const horizontal of [false, true]) {
             it(`follows the first reversal after a pause (horizontal=${horizontal})`, () => {
                 setupFixedSizeItems(100, 50);
@@ -812,32 +1262,35 @@ describe("calculateItemsInView", () => {
                 mockState.scroll = 1000;
                 mockState.scrollLength = 300;
                 mockState.triggerCalculateItemsInView = () => calculateItemsInView(mockCtx);
-                const timeout = spyOn(mockState.scheduledWork, "timeout");
+                jest.useFakeTimers();
+                try {
+                    calculateItemsInView(mockCtx, { scrollVelocity: 4 });
+                    expect([mockState.startBuffered, mockState.endBuffered]).toEqual([20, 36]);
+                    jest.advanceTimersByTime(100);
+                    expect([mockState.startBuffered, mockState.endBuffered]).toEqual([17, 33]);
+                    // A second idle calculation must not shift the buffer again.
+                    calculateItemsInView(mockCtx);
+                    expect([mockState.startBuffered, mockState.endBuffered]).toEqual([17, 33]);
 
-                calculateItemsInView(mockCtx, { scrollVelocity: 4 });
-                expect([mockState.startBuffered, mockState.endBuffered]).toEqual([20, 36]);
-                timeout.mock.calls.at(-1)![0]();
-                expect([mockState.startBuffered, mockState.endBuffered]).toEqual([17, 33]);
-                // A second idle calculation must not shift the buffer again.
-                calculateItemsInView(mockCtx);
-                expect([mockState.startBuffered, mockState.endBuffered]).toEqual([17, 33]);
+                    calculateItemsInView(mockCtx, { scrollVelocity: -4 });
+                    jest.advanceTimersByTime(100);
+                    expect([mockState.startBuffered, mockState.endBuffered]).toEqual([12, 28]);
 
-                calculateItemsInView(mockCtx, { scrollVelocity: -4 });
-                timeout.mock.calls.at(-1)![0]();
-                expect([mockState.startBuffered, mockState.endBuffered]).toEqual([12, 28]);
-
-                calculateItemsInView(mockCtx, { scrollVelocity: 4 });
-                mockState.scrollHistory = [
-                    { scroll: 900, time: Date.now() - 16 },
-                    { scroll: 1000, time: Date.now() },
-                ];
-                resetInitialRenderState(mockCtx, { resetLayout: true });
-                mockCtx.values.set("readyToRender", true);
-                expect(mockState.scheduledWork.has("renderRangeProjection")).toBe(false);
-                calculateItemsInView(mockCtx);
-                // A new dataset has no remembered direction: use initial placement.
-                expect([mockState.startBuffered, mockState.endBuffered]).toEqual([12, 28]);
-                timeout.mockRestore();
+                    calculateItemsInView(mockCtx, { scrollVelocity: 4 });
+                    mockState.scrollHistory = [
+                        { scroll: 900, time: Date.now() - 16 },
+                        { scroll: 1000, time: Date.now() },
+                    ];
+                    resetInitialRenderState(mockCtx, { resetLayout: true });
+                    mockCtx.values.set("readyToRender", true);
+                    expect(mockState.scheduledWork.has("renderRangeProjection")).toBe(false);
+                    calculateItemsInView(mockCtx);
+                    // A new dataset has no remembered direction: use initial placement.
+                    expect([mockState.startBuffered, mockState.endBuffered]).toEqual([12, 28]);
+                } finally {
+                    mockState.scheduledWork.dispose();
+                    jest.useRealTimers();
+                }
             });
         }
 
@@ -929,6 +1382,42 @@ describe("calculateItemsInView", () => {
                 });
             } finally {
                 updateItemPositionsSpy.mockRestore();
+            }
+        });
+
+        it("keeps the reader anchor current inside a cached range while a streamed row grows", () => {
+            const prevPlatform = Platform.OS;
+            Platform.OS = "web";
+            try {
+                setupFixedSizeItems(3, 100);
+                mockState.props.getFixedItemSize = undefined;
+                mockState.props.maintainVisibleContentPosition = normalizeMaintainVisibleContentPosition(true);
+                mockState.didContainersLayout = true;
+                mockState.didFinishInitialScroll = true;
+                mockState.scrollLength = 500;
+                mockState.sizes.set("item_1", 3000);
+                mockState.sizesKnown.set("item_1", 3000);
+                setLayoutValue(mockState, "positions", "item_2", 3100);
+                mockState.totalSize = 3200;
+                mockCtx.values.set("totalSize", 3200);
+                mockState.scroll = 2700;
+                calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+                expect(mockState.idsInView).toEqual(["item_2"]);
+
+                interruptUserScroll(mockCtx, -950);
+                mockState.scroll = 1750;
+                mockState.scrollForNextCalculateItemsInView = { bottom: 4000, top: -1000 };
+                calculateItemsInView(mockCtx, { scrollVelocity: 0 });
+                for (let i = 0; i < 3; i++) {
+                    const maintain = mvcpModule.prepareMVCP(mockCtx, false, "item-size")!;
+                    mockState.positions[2]! += 125;
+                    mockState.totalSize += 125;
+                    mockCtx.values.set("totalSize", mockState.totalSize);
+                    maintain();
+                    expect(mockState.scroll).toBe(1750);
+                }
+            } finally {
+                Platform.OS = prevPlatform;
             }
         });
 
@@ -2358,6 +2847,8 @@ describe("calculateItemsInView", () => {
                 bottom: 2000,
                 top: -1000,
             };
+            mockState.startBuffered = 0;
+            mockState.endBuffered = 2;
             mockState.idsInView = ["cached"];
             mockCtx.values.set("activeStickyIndex", 0);
             mockState.scroll = 150; // Should activate sticky index 1
@@ -2369,7 +2860,7 @@ describe("calculateItemsInView", () => {
                 index: 1,
                 item: mockState.props.data[1],
             });
-            expect(mockState.idsInView).toEqual(["cached"]);
+            expect(mockState.idsInView).toEqual(["item_2"]);
         });
 
         it("should not call onStickyHeaderChange when the sticky index remains the same", () => {

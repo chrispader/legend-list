@@ -9,13 +9,15 @@ import { getAutoOtherAxisStyle } from "@/components/listComponentStyles";
 import { ScrollAdjust } from "@/components/ScrollAdjust";
 import { SnapWrapper } from "@/components/SnapWrapper";
 import { ENABLE_DEVMODE } from "@/constants";
-import { doMaintainScrollAtEnd } from "@/core/doMaintainScrollAtEnd";
+import { IsNewArchitecture } from "@/constants-platform";
+import { interruptUserScroll } from "@/core/cancelScroll";
+import { doMaintainScrollAtEnd, reissueClampedNativeEndScroll } from "@/core/doMaintainScrollAtEnd";
 import type { ScrollAdjustHandler } from "@/core/ScrollAdjustHandler";
 import { setFooterSize, setHeaderSize } from "@/core/updateContentMetrics";
 import { useStableRenderComponent } from "@/hooks/useStableRenderComponent";
 import { LayoutView } from "@/platform/LayoutView";
 import { Platform } from "@/platform/Platform";
-import { StyleSheet } from "@/platform/StyleSheet";
+import { isScreenReaderEnabled } from "@/platform/screenReader";
 import type {
     LayoutChangeEvent,
     LayoutRectangle,
@@ -36,6 +38,7 @@ import { isHorizontalRTL } from "@/utils/rtl";
 interface ListComponentProps<ItemT>
     extends Omit<
         LegendListPropsBase<ItemT, LooseScrollViewProps> & { scrollEventThrottle: number | undefined },
+        | "contentContainerStyle"
         | "data"
         | "estimatedItemSize"
         | "drawDistance"
@@ -46,6 +49,8 @@ interface ListComponentProps<ItemT>
         | "renderScrollComponent"
         | "style"
     > {
+    autoscrollToTopThreshold: number | undefined;
+    contentContainerStyle: ViewStyle;
     horizontal: boolean;
     initialContentOffset: number | undefined;
     freshDataTransitionEpoch: number;
@@ -90,6 +95,7 @@ const AlignItemsAtEndSpacer = typedMemo(function AlignItemsAtEndSpacer({ horizon
 
 // biome-ignore lint/nursery/noShadow: const function name shadowing is intentional
 export const ListComponent = typedMemo(function ListComponent<ItemT>({
+    autoscrollToTopThreshold,
     canRender,
     freshDataTransitionEpoch,
     style,
@@ -100,6 +106,7 @@ export const ListComponent = typedMemo(function ListComponent<ItemT>({
     ItemSeparatorComponent,
     alignItemsAtEnd: _alignItemsAtEnd,
     onScroll,
+    onScrollToTop,
     onLayout,
     ListHeaderComponent,
     ListHeaderComponentStyle,
@@ -132,10 +139,8 @@ export const ListComponent = typedMemo(function ListComponent<ItemT>({
     let anchoredEndSpaceStyle: ViewStyle | undefined;
     if (shouldMaterializeAnchoredEndSpace) {
         const paddingEnd = horizontal ? (isHorizontalRTL(ctx.state) ? "Left" : "Right") : "Bottom";
-        const flattenedContentContainerStyle = StyleSheet.flatten(contentContainerStyle) as ViewStyle | undefined;
         anchoredEndSpaceStyle = {
-            [`padding${paddingEnd}`]:
-                extractPadding({}, flattenedContentContainerStyle || {}, paddingEnd) + anchoredEndSpaceSize,
+            [`padding${paddingEnd}`]: extractPadding({}, contentContainerStyle, paddingEnd) + anchoredEndSpaceSize,
         };
     }
     const autoOtherAxisStyle = getAutoOtherAxisStyle({
@@ -178,6 +183,33 @@ export const ListComponent = typedMemo(function ListComponent<ItemT>({
         }
     }, [ListHeaderComponent, ListFooterComponent, ctx, updateFooterSize]);
 
+    const onScrollToTopInternal = useCallback(
+        (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+            interruptUserScroll(ctx);
+            const accessibility = ctx.state.accessibilityScrollEvent;
+            // UIKit completion can trail the final subpixel frames beyond the burst idle gap.
+            const alreadyReported =
+                isScreenReaderEnabled() &&
+                accessibility?.time !== undefined &&
+                !accessibility.blocked &&
+                accessibility.direction === -1 &&
+                accessibility.scroll <= 1;
+            if (accessibility) accessibility.time = undefined;
+            if (!alreadyReported) ctx.state.props.onUserScroll?.();
+            onScrollToTop?.(event);
+        },
+        [ctx, onScrollToTop],
+    );
+
+    const { onContentSizeChange } = rest;
+    const onContentSizeChangeInternal = useCallback(
+        (width: number, height: number) => {
+            reissueClampedNativeEndScroll(ctx);
+            onContentSizeChange?.(width, height);
+        },
+        [ctx, onContentSizeChange],
+    );
+
     const onLayoutHeader = useCallback(
         (rect: LayoutRectangle) => {
             const size = rect[horizontal ? "width" : "height"];
@@ -196,6 +228,18 @@ export const ListComponent = typedMemo(function ListComponent<ItemT>({
         [horizontal, onLayoutFooter, updateFooterSize],
     );
 
+    const footer = ListFooterComponent && (
+        <LayoutView onLayoutChange={onLayoutFooterInternal} style={ListFooterComponentStyle}>
+            {getComponent(ListFooterComponent)}
+        </LayoutView>
+    );
+    const renderRows = canRender && !ListEmptyComponent;
+    const extentFooter =
+        IsNewArchitecture && Platform.OS !== "web" && !horizontal && ctx.state.props.contentExtentComponentInternal
+            ? footer
+            : undefined;
+    const rowGap = extentFooter && (contentContainerStyle.rowGap ?? contentContainerStyle.gap);
+
     return (
         <SnapOrScroll
             {...rest}
@@ -203,7 +247,12 @@ export const ListComponent = typedMemo(function ListComponent<ItemT>({
                 ? ScrollComponent === ListComponentScrollView
                     ? { onInternalScrollEnd, scrollElement, useWindowScroll }
                     : {}
-                : { onScrollBeginDrag: onInternalScrollBeginDrag, onScrollEndDrag: onInternalScrollEndDrag })}
+                : {
+                      onContentSizeChange: onContentSizeChangeInternal,
+                      onScrollBeginDrag: onInternalScrollBeginDrag,
+                      onScrollEndDrag: onInternalScrollEndDrag,
+                      onScrollToTop: onScrollToTopInternal,
+                  })}
             contentContainerStyle={[
                 horizontal ? { height: "100%" } : {},
                 contentContainerStyle,
@@ -220,7 +269,9 @@ export const ListComponent = typedMemo(function ListComponent<ItemT>({
             horizontal={horizontal}
             maintainVisibleContentPosition={
                 maintainVisibleContentPosition.size || maintainVisibleContentPosition.data
-                    ? { minIndexForVisible: 0 }
+                    ? Platform.OS !== "web" && autoscrollToTopThreshold !== undefined
+                        ? { autoscrollToTopThreshold, minIndexForVisible: 0 }
+                        : { minIndexForVisible: 0 }
                     : undefined
             }
             onLayout={onLayout}
@@ -229,7 +280,7 @@ export const ListComponent = typedMemo(function ListComponent<ItemT>({
             ScrollComponent={snapToIndices ? ScrollComponent : (undefined as any)}
             style={autoOtherAxisStyle ? [autoOtherAxisStyle, style] : style}
         >
-            <ScrollAdjust />
+            {Platform.OS !== "web" && <ScrollAdjust />}
             {ListHeaderComponent && (
                 <LayoutView onLayoutChange={onLayoutHeader} style={ListHeaderComponentStyle}>
                     {getComponent(ListHeaderComponent)}
@@ -238,21 +289,21 @@ export const ListComponent = typedMemo(function ListComponent<ItemT>({
             {ListEmptyComponent && getComponent(ListEmptyComponent)}
             {shouldRenderAlignItemsAtEndSpacer && <AlignItemsAtEndSpacer horizontal={horizontal} />}
 
-            {canRender && !ListEmptyComponent && (
+            {(renderRows || extentFooter) && (
                 <Containers
+                    contentRowGap={typeof rowGap === "number" ? Math.max(0, rowGap) : undefined}
+                    footer={extentFooter}
                     freshDataTransitionEpoch={freshDataTransitionEpoch}
                     getRenderedItem={getRenderedItem}
                     horizontal={horizontal!}
                     ItemSeparatorComponent={ItemSeparatorComponent}
                     recycleItems={recycleItems!}
+                    renderRows={renderRows}
                     stickyHeaderConfig={stickyHeaderConfig}
                 />
             )}
-            {ListFooterComponent && (
-                <LayoutView onLayoutChange={onLayoutFooterInternal} style={ListFooterComponentStyle}>
-                    {getComponent(ListFooterComponent)}
-                </LayoutView>
-            )}
+            {!extentFooter && footer}
+            {Platform.OS === "web" && <ScrollAdjust />}
             {IS_DEV && ENABLE_DEVMODE && <DevNumbers />}
         </SnapOrScroll>
     );

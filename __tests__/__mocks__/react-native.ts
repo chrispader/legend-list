@@ -84,6 +84,9 @@ const AnimatedScrollView = createHostComponent("AnimatedScrollView");
 const AnimatedView = createHostComponent("AnimatedView");
 
 export const Animated = {
+    attachNativeEvent(_view: unknown, _eventName: string, _mapping: unknown[]) {
+        return { detach() {} };
+    },
     // In tests we simply return the passed component without wrapping
     createAnimatedComponent<T extends AnyFunction>(Component: T): T {
         return Component;
@@ -114,3 +117,8 @@ export const ScrollView = createHostComponent("ScrollView");
 
 export type View = any; // for type-only imports
 export type ScrollView = any; // for type-only imports
+
+export const AccessibilityInfo = {
+    addEventListener: (_event: string, _callback: (enabled: boolean) => void) => ({ remove: () => {} }),
+    isScreenReaderEnabled: () => Promise.resolve(false),
+};

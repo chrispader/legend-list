@@ -1,5 +1,7 @@
+import { Platform } from "@/platform/Platform";
 import { peek$, type StateContext } from "@/state/state";
 import { IS_DEV } from "@/utils/devEnvironment";
+import { isSparePoolPending } from "@/utils/getEffectiveDrawDistance";
 
 export interface ContainerAllocation {
     containerIndex: number;
@@ -44,8 +46,11 @@ export function findAvailableContainers(
     const { containerItemMetadata, stickyContainerPool } = state;
     const { data, getItemType } = state.props;
     const hasItemTypes = !!getItemType;
-    const shouldAvoidAssignedContainerReuse = state.props.recycleItems && !!state.props.positionComponentInternal;
+    const shouldAvoidAssignedContainerReuse = state.props.recycleItems && !!state.props.hasItemLayoutAnimationInternal;
     const pendingRemovalSet = pendingRemoval.length > 0 ? new Set(pendingRemoval) : undefined;
+    // Recycling a focused web row would move focus onto another item and force the DOM sort
+    // to carry every other row past it, so keep that row mounted while its item exists.
+    const focusedContainerIndex = Platform.OS === "web" ? getFocusedContainerIndex(ctx) : undefined;
 
     const requests = new Array<RequestedContainer>(numNeeded);
     const normalRequests: RequestedContainer[] = [];
@@ -67,8 +72,8 @@ export function findAvailableContainers(
     const normalCandidates: AvailableContainer[] = [];
     const stickyCandidates: AvailableContainer[] = [];
 
-    // Unassigned and pending-removal containers are immediately reusable, so they
-    // sort ahead with an infinite distance. Assigned normal containers are eligible
+    // Pending-removal containers sort first; with recycling enabled, warm normal
+    // containers precede empty slots (distance 0) to avoid mounting new row trees. Assigned containers are eligible
     // only outside the buffered range and are ranked farthest-first to avoid stealing
     // a container that may soon re-enter the viewport. Assigned reuse is disabled while
     // recycled layout animations may still need the outgoing view. Sticky containers
@@ -76,7 +81,12 @@ export function findAvailableContainers(
     for (let containerIndex = 0; containerIndex < numContainers; containerIndex++) {
         const key = peek$(ctx, `containerItemKey${containerIndex}`);
         const isPendingRemoval = !!pendingRemovalSet?.has(containerIndex);
-        const isProtected = !!key && !!protectedKeys?.has(key) && state.indexByKey.has(key);
+        const isProtected =
+            (!!key && !!protectedKeys?.has(key) && state.indexByKey.has(key)) ||
+            (containerIndex === focusedContainerIndex &&
+                !isPendingRemoval &&
+                key !== undefined &&
+                state.indexByKey.has(key));
 
         if (isProtected) {
             continue;
@@ -87,7 +97,10 @@ export function findAvailableContainers(
                 stickyCandidates.push({ containerIndex, distance: Number.POSITIVE_INFINITY });
             }
         } else if (key === undefined || isPendingRemoval) {
-            normalCandidates.push({ containerIndex, distance: Number.POSITIVE_INFINITY });
+            normalCandidates.push({
+                containerIndex,
+                distance: isPendingRemoval || !state.props.recycleItems ? Number.POSITIVE_INFINITY : 0,
+            });
         } else if (!shouldAvoidAssignedContainerReuse) {
             const index = state.indexByKey.get(key);
             if (index !== undefined && (index < startBuffered || index > endBuffered)) {
@@ -195,7 +208,7 @@ export function findAvailableContainers(
         }
     }
 
-    if (IS_DEV) {
+    if (IS_DEV && !isSparePoolPending(state)) {
         const numContainersPooled = peek$(ctx, "numContainersPooled") ?? Number.POSITIVE_INFINITY;
         if (nextNewContainerIndex > numContainersPooled) {
             console.warn(
@@ -266,6 +279,20 @@ function reorderPoolAssignments(
             for (let i = 0; i < requests.length; i++) {
                 allocations[requests[i].order].containerIndex = containerIndices[i];
             }
+        }
+    }
+}
+
+function getFocusedContainerIndex(ctx: StateContext) {
+    let focused: Element | null | undefined;
+    for (const [containerIndex, viewRef] of ctx.viewRefs) {
+        const element = viewRef.current as HTMLElement | null;
+        if (element) {
+            if (focused === undefined) {
+                focused = (element.getRootNode() as Document | ShadowRoot).activeElement;
+                if (!focused || !element.parentNode?.contains(focused)) return undefined;
+            }
+            if (element.contains(focused)) return containerIndex;
         }
     }
 }

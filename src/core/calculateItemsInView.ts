@@ -2,6 +2,7 @@ import { ENABLE_DEBUG_VIEW, POSITION_OUT_OF_VIEW } from "@/constants";
 import { IsNewArchitecture } from "@/constants-platform";
 import { evaluateBootstrapInitialScroll } from "@/core/bootstrapInitialScroll";
 import { createContainerItemMetadata, resolveContainerItemMetadata } from "@/core/containerItemMetadata";
+import { getItemSpaceOffset, getStartOffsetAdjustment } from "@/core/getStartOffsetAdjustment";
 import { resolveInitialScrollOffset } from "@/core/initialScroll";
 import { handleInitialScrollLayoutReady } from "@/core/initialScrollLifecycle";
 import { prepareMVCP } from "@/core/mvcp";
@@ -13,19 +14,20 @@ import { updateViewableItems } from "@/core/viewability";
 import { batchedUpdates } from "@/platform/batchedUpdates";
 import { Platform } from "@/platform/Platform";
 import { getContentSize } from "@/state/getContentSize";
-import { peek$, type StateContext, set$ } from "@/state/state";
+import { type DeferredListeners, peek$, type StateContext, set$ } from "@/state/state";
 import type { InternalState, ScrollAdjustmentSource } from "@/types.internal";
 import { checkAllSizesKnown } from "@/utils/checkAllSizesKnown";
 import { getExpandedContainerPoolSize } from "@/utils/containerPool";
 import { findAvailableContainers } from "@/utils/findAvailableContainers";
 import type { DrawDistanceMode } from "@/utils/getEffectiveDrawDistance";
-import { getEffectiveDrawDistance } from "@/utils/getEffectiveDrawDistance";
+import { getEffectiveDrawDistance, isSparePoolPending } from "@/utils/getEffectiveDrawDistance";
 import { getId } from "@/utils/getId";
 import { getItemSize } from "@/utils/getItemSize";
 import { getScrollVelocity } from "@/utils/getScrollVelocity";
 import { hasActiveInitialScroll } from "@/utils/hasActiveInitialScroll";
 import { isNullOrUndefined } from "@/utils/helpers";
 import { isInMVCPActiveMode } from "@/utils/isInMVCPActiveMode";
+import { isHorizontalRTL } from "@/utils/rtl";
 import { setDidLayout } from "@/utils/setDidLayout";
 
 const RENDER_RANGE_PROJECTION_FULL_VELOCITY = 4;
@@ -42,14 +44,22 @@ function getProjectedBufferAdjustment(scrollVelocity: number, trailingBuffer: nu
 
 function scheduleRenderRangeProjectionSettle(ctx: StateContext) {
     const state = ctx.state;
-    state.scheduledWork.timeout(
-        () => {
+    const key = "renderRangeProjection";
+    state.renderRangeProjectionSettleAt = performance.now() + RENDER_RANGE_PROJECTION_SETTLE_DELAY;
+    if (state.scheduledWork.has(key)) {
+        return;
+    }
+
+    const settle = () => {
+        const remaining = Math.ceil(state.renderRangeProjectionSettleAt! - performance.now());
+        if (remaining > 0) {
+            state.scheduledWork.timeout(settle, remaining, key);
+        } else {
             state.scrollHistory.length = 0;
             state.triggerCalculateItemsInView?.();
-        },
-        RENDER_RANGE_PROJECTION_SETTLE_DELAY,
-        "renderRangeProjection",
-    );
+        }
+    };
+    state.scheduledWork.timeout(settle, RENDER_RANGE_PROJECTION_SETTLE_DELAY, key);
 }
 
 function findCurrentStickyIndex(stickyArray: number[], scroll: number, state: InternalState): number {
@@ -134,7 +144,10 @@ function handleStickyRecycling(
         const arrayIdx = stickyArray.indexOf(itemIndex);
         if (arrayIdx === -1) {
             state.stickyContainerPool.delete(containerIndex);
-            set$(ctx, `containerSticky${containerIndex}`, false);
+            // Pinned rows join the pool without becoming sticky; releasing them must not re-render them.
+            if (peek$(ctx, `containerSticky${containerIndex}`)) {
+                set$(ctx, `containerSticky${containerIndex}`, false);
+            }
             continue;
         }
 
@@ -228,36 +241,9 @@ function maybeEmitFirstVisibleItemChanged(state: InternalState, index: number | 
     onFirstVisibleItemChanged({ index, item: state.props.data[index], key });
 }
 
-function findFirstVisibleIndexInCachedRange(ctx: StateContext, scroll: number) {
-    const state = ctx.state;
-    const {
-        endBuffered,
-        idCache,
-        positions,
-        props: { data },
-        sizes,
-        startBuffered,
-    } = state;
-
-    if (startBuffered === null || endBuffered === null || startBuffered < 0 || endBuffered < startBuffered) {
-        return null;
-    }
-
-    for (let i = startBuffered; i <= endBuffered && i < data.length; i++) {
-        const id = idCache[i] ?? getId(state, i);
-        const size = sizes.get(id) ?? getItemSize(ctx, id, i, data[i]);
-        const top = positions[i]!;
-        if (top + size > scroll) {
-            return i;
-        }
-    }
-
-    return null;
-}
-
-function updateViewabilityForCachedRange(
+function updateVisibleRangeForCachedRange(
     ctx: StateContext,
-    viewabilityConfigCallbackPairs: NonNullable<InternalState["viewabilityConfigCallbackPairs"]>,
+    viewabilityConfigCallbackPairs: InternalState["viewabilityConfigCallbackPairs"],
     scrollLength: number,
     scroll: number,
     scrollBottom: number,
@@ -292,16 +278,13 @@ function updateViewabilityForCachedRange(
         }
     }
 
-    Object.assign(state, {
-        endNoBuffer: visibleRange.endNoBuffer,
-        firstFullyOnScreenIndex: visibleRange.firstFullyOnScreenIndex,
+    Object.assign(state, visibleRange, {
         idsInView: getIdsInVisibleRange(state, visibleRange),
-        startNoBuffer: visibleRange.startNoBuffer,
     });
 
     maybeEmitFirstVisibleItemChanged(state, visibleRange.startNoBuffer);
 
-    if (state.props.hasExternalScroll || (visibleRange.startNoBuffer !== null && visibleRange.endNoBuffer !== null)) {
+    if (viewabilityConfigCallbackPairs) {
         updateViewableItems(
             state,
             ctx,
@@ -315,11 +298,23 @@ function updateViewabilityForCachedRange(
     }
 }
 
+export function schedulePendingDataChangeLayout(ctx: StateContext) {
+    const state = ctx.state;
+    state.scheduledWork.microtask(() => {
+        // A normal commit handles this before the microtask. Suspense can keep its
+        // layout effects disconnected while the visible list still receives scrolls.
+        if (!state.isUnmounted && state.didDataChange && state.previousIndexByKey !== state.indexByKey) {
+            calculateItemsInView(ctx, { dataChanged: true, doMVCP: true });
+        }
+    }, "dataChangeLayout");
+}
+
 export function calculateItemsInView(
     ctx: StateContext,
     params: {
         doMVCP?: boolean;
         dataChanged?: boolean;
+        didMeasureEstimatedLayout?: boolean;
         drawDistanceMode?: DrawDistanceMode;
         forceFullItemPositions?: boolean;
         mvcpAdjustmentSource?: ScrollAdjustmentSource;
@@ -327,6 +322,18 @@ export function calculateItemsInView(
     } = {},
 ) {
     const state = ctx.state;
+    // Render refreshes key lookups before the parent's data-change layout pass.
+    // If keys moved, preserve the old positions/slots until that pass captures MVCP.
+    // Stable indices (such as an append) can still update while Suspense hides effects.
+    if (state.didDataChange && !state.isFirst && !params.dataChanged && state.previousIndexByKey !== state.indexByKey) {
+        if (!state.previousIndexByKey) return;
+        for (const [key, index] of state.previousIndexByKey) {
+            if (state.indexByKey.get(key) !== index) {
+                schedulePendingDataChangeLayout(ctx);
+                return;
+            }
+        }
+    }
     batchedUpdates(() => {
         const {
             columns,
@@ -347,7 +354,8 @@ export function calculateItemsInView(
         const stickyHeaderIndicesArr = state.props.stickyHeaderIndicesArr || [];
         const stickyHeaderIndicesSet = state.props.stickyHeaderIndicesSet || new Set<number>();
         const drawDistance = getEffectiveDrawDistance(ctx, params.drawDistanceMode);
-        const { dataChanged, doMVCP, forceFullItemPositions, mvcpAdjustmentSource } = params;
+        const { dataChanged, didMeasureEstimatedLayout, forceFullItemPositions } = params;
+        const { hasEstimatedInitialLayout } = state;
         const bootstrapInitialScrollState =
             state.initialScrollSession?.kind === "bootstrap" ? state.initialScrollSession.bootstrap : undefined;
         const suppressInitialScrollSideEffects = !!bootstrapInitialScrollState;
@@ -356,9 +364,11 @@ export function calculateItemsInView(
             return;
         }
 
-        let totalSize = getContentSize(ctx);
+        // Native RTL rows are positioned within the item extent, before the container minimum.
+        const includeContentContainerMinSize = Platform.OS === "web" || !isHorizontalRTL(state);
+        let totalSize = getContentSize(ctx, includeContentContainerMinSize);
         let changedContainerIds: Set<number> | undefined;
-        const topPad = peek$(ctx, "stylePaddingTop") + peek$(ctx, "alignItemsAtEndPadding") + peek$(ctx, "headerSize");
+        const topPad = getStartOffsetAdjustment(ctx);
         const numColumns = peek$(ctx, "numColumns");
         const speed = params.scrollVelocity ?? getScrollVelocity(state);
 
@@ -378,7 +388,6 @@ export function calculateItemsInView(
               : state.scroll;
 
         let scrollAdjustPending = 0;
-        let scrollAdjustPad = 0;
         let scroll = 0;
         let scrollTopBuffered = 0;
         let scrollBottom = 0;
@@ -387,9 +396,8 @@ export function calculateItemsInView(
         const updateScroll = (nextScrollState: number) => {
             nativeScrollState = nextScrollState;
             scrollAdjustPending = peek$(ctx, "scrollAdjustPending") ?? 0;
-            scrollAdjustPad = scrollAdjustPending - topPad;
             // Subtract top padding to put scroll into the coordinate system of the item positions
-            scroll = Math.round(nextScrollState + scrollExtra + scrollAdjustPad);
+            scroll = getItemSpaceOffset(ctx, nextScrollState + scrollExtra, scrollAdjustPending, topPad);
             if (!state.props.hasExternalScroll && scroll + scrollLength > totalSize) {
                 // Sometimes we may have scrolled past the visible area which can make items at the top of the
                 // screen not render. So make sure we clamp scroll to the end.
@@ -413,7 +421,9 @@ export function calculateItemsInView(
                 set$(ctx, "activeStickyIndex", nextActiveStickyIndex);
             }
             const shouldNotifyStickyHeaderChange =
-                !!onStickyHeaderChange && stickyHeaderIndicesArr.length > 0 && stickyIndexDidChange;
+                !!onStickyHeaderChange &&
+                stickyHeaderIndicesArr.length > 0 &&
+                (stickyIndexDidChange || didMeasureEstimatedLayout);
             return {
                 currentStickyIdx,
                 finishCalculateItemsInView: shouldNotifyStickyHeaderChange
@@ -468,6 +478,13 @@ export function calculateItemsInView(
             scrollBottom = Math.max(scrollStart, scroll + scrollLength + overscrollBeforeContent);
             scrollTopBuffered = scrollStart - scrollBufferTop + projectedBufferAdjustment;
             scrollBottomBuffered = scrollBottom + scrollBufferBottom + projectedBufferAdjustment;
+            if (scrollTopBuffered < 0 && state.didFullDrawDistancePrewarm) {
+                // After the first paint, prewarm rows below it so they are mounted before a fling.
+                scrollBottomBuffered = Math.max(
+                    scrollBottomBuffered,
+                    scrollLength + scrollBufferTop + scrollBufferBottom + (state.props.estimatedItemSize ?? 0),
+                );
+            }
         };
         updateScrollRange();
 
@@ -478,6 +495,7 @@ export function calculateItemsInView(
         // Check precomputed scroll range to see if we can skip this check
         if (
             enableScrollForNextCalculateItemsInView &&
+            !hasEstimatedInitialLayout &&
             !suppressInitialScrollSideEffects &&
             !dataChanged &&
             !forceFullItemPositions &&
@@ -492,22 +510,27 @@ export function calculateItemsInView(
             ) {
                 // On web, MVCP anchor lock still needs a pass even inside the cached range window.
                 if (Platform.OS !== "web" || !isInMVCPActiveMode(state)) {
-                    if (viewabilityConfigCallbackPairs) {
-                        updateViewabilityForCachedRange(
-                            ctx,
-                            viewabilityConfigCallbackPairs,
-                            scrollLength,
-                            scroll,
-                            scrollBottom,
-                        );
-                    } else if (state.props.onFirstVisibleItemChanged) {
-                        maybeEmitFirstVisibleItemChanged(state, findFirstVisibleIndexInCachedRange(ctx, scroll));
-                    }
+                    updateVisibleRangeForCachedRange(
+                        ctx,
+                        viewabilityConfigCallbackPairs,
+                        scrollLength,
+                        scroll,
+                        scrollBottom,
+                    );
                     stickyState?.finishCalculateItemsInView?.();
                     return;
                 }
             }
         }
+
+        // A deferred item-size correction must land in any pass that repositions items, or they move without it.
+        const shouldApplyDeferredMVCP =
+            !hasEstimatedInitialLayout && !params.doMVCP && state.scheduledWork.has("mvcpRecalculate");
+        if (shouldApplyDeferredMVCP) {
+            state.scheduledWork.cancel("mvcpRecalculate");
+        }
+        const doMVCP = !hasEstimatedInitialLayout && (params.doMVCP || shouldApplyDeferredMVCP);
+        const mvcpAdjustmentSource = shouldApplyDeferredMVCP ? "item-size" : params.mvcpAdjustmentSource;
 
         ////// Update item positions and do MVCP
         // Handle maintainVisibleContentPosition adjustment early
@@ -537,11 +560,15 @@ export function calculateItemsInView(
             scrollVelocity: speed,
             startIndex,
         });
+        // Advance the position snapshot for later pending renders and the eventual commit.
+        if (state.previousIndexByKey) {
+            state.previousIndexByKey = indexByKey;
+        }
 
         // Appends can grow content size while the scroll offset is unchanged. Refresh the
         // cached content size after positions update so the next scroll-range cache reflects
         // the new tail instead of the pre-update end-of-list.
-        totalSize = getContentSize(ctx);
+        totalSize = getContentSize(ctx, includeContentContainerMinSize);
 
         if (positionRecalculationStartIndex !== undefined) {
             // Clear the invalidation marker after using it for position updates.
@@ -673,14 +700,11 @@ export function calculateItemsInView(
             }
         }
 
-        Object.assign(state, {
+        Object.assign(state, visibleRange, {
             endBuffered,
-            endNoBuffer: visibleRange.endNoBuffer,
-            firstFullyOnScreenIndex: visibleRange.firstFullyOnScreenIndex,
             idsInView: getIdsInVisibleRange(state, visibleRange),
             startBuffered,
             startBufferedId,
-            startNoBuffer: visibleRange.startNoBuffer,
         });
 
         // Precompute the scroll that will be needed for the range to change
@@ -730,6 +754,8 @@ export function calculateItemsInView(
             alwaysRenderIndicesSet.has(index) ||
             (hasScrollTargetPinnedRange && index >= scrollTargetPinnedStart && index <= scrollTargetPinnedEnd);
 
+        // Container signals notify after the sync loop so each subscriber runs once per pass.
+        const deferred: DeferredListeners = new Map();
         // Place newly added items into containers
         if (
             (startBuffered !== null && endBuffered !== null) ||
@@ -840,13 +866,13 @@ export function calculateItemsInView(
                                 state.sizesKnown.has(id) ||
                                 resolveContainerItemMetadata(state, containerIndex, i, data[i]).fixedItemSize !==
                                     undefined;
-                            set$(ctx, `containerLayoutReady${containerIndex}`, isLayoutReady);
+                            set$(ctx, `containerLayoutReady${containerIndex}`, isLayoutReady, deferred);
                         }
                     }
 
-                    set$(ctx, `containerItemKey${containerIndex}`, id);
-                    set$(ctx, `containerItemIndex${containerIndex}`, i);
-                    set$(ctx, `containerItemData${containerIndex}`, data[i]);
+                    set$(ctx, `containerItemKey${containerIndex}`, id, deferred);
+                    set$(ctx, `containerItemIndex${containerIndex}`, i, deferred);
+                    set$(ctx, `containerItemData${containerIndex}`, data[i], deferred);
 
                     // Update cache when adding new item
                     containerItemKeys!.set(id, containerIndex);
@@ -857,12 +883,12 @@ export function calculateItemsInView(
                     const isSticky = stickyHeaderIndicesSet.has(i);
                     const isPinnedRender = isPinnedRenderIndex(i);
                     if (isSticky) {
-                        set$(ctx, containerSticky, true);
+                        set$(ctx, containerSticky, true, deferred);
                         // Add container to sticky pool
                         state.stickyContainerPool.add(containerIndex);
                     } else {
                         if (peek$(ctx, containerSticky)) {
-                            set$(ctx, containerSticky, false);
+                            set$(ctx, containerSticky, false, deferred);
                         }
                         if (isPinnedRender) {
                             // This pool also protects alwaysRender/internal pin containers from reuse.
@@ -880,7 +906,13 @@ export function calculateItemsInView(
                 if (numContainers !== prevNumContainers) {
                     set$(ctx, "numContainers", numContainers);
                     if (numContainers > peek$(ctx, "numContainersPooled")) {
-                        set$(ctx, "numContainersPooled", getExpandedContainerPoolSize(dataLength, numContainers));
+                        set$(
+                            ctx,
+                            "numContainersPooled",
+                            isSparePoolPending(state)
+                                ? numContainers
+                                : getExpandedContainerPoolSize(dataLength, numContainers),
+                        );
                     }
                 }
             }
@@ -891,7 +923,8 @@ export function calculateItemsInView(
         }
 
         // Handle sticky container recycling
-        if (state.stickyContainerPool.size > 0) {
+        const hasStickyContainers = state.stickyContainerPool.size > 0;
+        if (hasStickyContainers) {
             handleStickyRecycling(
                 ctx,
                 stickyHeaderIndicesArr,
@@ -905,8 +938,20 @@ export function calculateItemsInView(
 
         const pendingRemovalSet = pendingRemoval.length > 0 ? new Set(pendingRemoval) : undefined;
         let didChangePositions = false;
-        // Update top positions of all containers
+        let didChangeIndex = false;
+        // Grid spans and RTL positions can change independently of the row tops.
+        const canReuseContainerSync = numColumns === 1 && !isHorizontalRTL(state);
+        const syncOnlyChanged =
+            canReuseContainerSync &&
+            state.containerSyncAdjust === scrollAdjustPending &&
+            !dataChanged &&
+            !state.didDataChange &&
+            !forceFullItemPositions &&
+            !hasStickyContainers;
+        state.containerSyncAdjust = canReuseContainerSync ? scrollAdjustPending : undefined;
+
         for (let i = 0; i < numContainers; i++) {
+            if (syncOnlyChanged && !changedContainerIds?.has(i)) continue;
             const itemKey = peek$(ctx, `containerItemKey${i}`);
 
             // If it's pending removal, then it's not in view anymore
@@ -924,22 +969,24 @@ export function calculateItemsInView(
 
                 // Clear sticky state if this was a sticky container
                 if (state.stickyContainerPool.has(i)) {
-                    set$(ctx, `containerSticky${i}`, false);
+                    set$(ctx, `containerSticky${i}`, false, deferred);
                     // Remove container from sticky pool
                     state.stickyContainerPool.delete(i);
                 }
 
-                set$(ctx, `containerItemKey${i}`, undefined);
-                set$(ctx, `containerItemIndex${i}`, undefined);
-                set$(ctx, `containerItemData${i}`, undefined);
-                set$(ctx, `containerPosition${i}`, POSITION_OUT_OF_VIEW);
-                set$(ctx, `containerColumn${i}`, -1);
-                set$(ctx, `containerSpan${i}`, 1);
+                set$(ctx, `containerItemKey${i}`, undefined, deferred);
+                set$(ctx, `containerItemIndex${i}`, undefined, deferred);
+                set$(ctx, `containerItemData${i}`, undefined, deferred);
+                set$(ctx, `containerPosition${i}`, POSITION_OUT_OF_VIEW, deferred);
+                set$(ctx, `containerColumn${i}`, -1, deferred);
+                set$(ctx, `containerSpan${i}`, 1, deferred);
             } else {
                 const itemIndex = indexByKey.get(itemKey);
                 if (itemIndex !== undefined) {
+                    didChangeIndex ||= peek$(ctx, `containerItemIndex${i}`) !== itemIndex;
                     didChangePositions =
                         syncMountedContainer(ctx, i, itemIndex, {
+                            deferred,
                             scrollAdjustPending,
                             updateLayout: true,
                         }).didChangePosition || didChangePositions;
@@ -947,12 +994,23 @@ export function calculateItemsInView(
             }
         }
 
+        for (const [listener, value] of deferred) {
+            listener(value);
+        }
+
         if (changedContainerIds && (IsNewArchitecture || Platform.OS === "web")) {
             scheduleContainerLayout(ctx, changedContainerIds);
+        } else if (Platform.OS === "web" && didChangeIndex) {
+            // Retained rows changed order; wake the coordinator to sort DOM order without remeasuring.
+            set$(ctx, "containerLayoutEpoch", (peek$(ctx, "containerLayoutEpoch") ?? 0) + 1);
         }
 
         if (Platform.OS === "web" && didChangePositions) {
             set$(ctx, "lastPositionUpdate", Date.now());
+        }
+
+        if (hasEstimatedInitialLayout) {
+            return;
         }
 
         if (suppressInitialScrollSideEffects) {
@@ -973,11 +1031,8 @@ export function calculateItemsInView(
             }
         }
 
-        if (
-            viewabilityConfigCallbackPairs &&
-            (state.props.hasExternalScroll ||
-                (visibleRange.startNoBuffer !== null && visibleRange.endNoBuffer !== null))
-        ) {
+        // A calculated empty range must clear reported rows and pending dwell.
+        if (viewabilityConfigCallbackPairs) {
             updateViewableItems(
                 ctx.state,
                 ctx,

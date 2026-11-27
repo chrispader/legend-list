@@ -1,3 +1,75 @@
+## 3.9.2
+
+- Fix: On web, items no longer jump for a frame when a scroll event repositions them before a pending size correction is applied. #596
+- Fix: New data that arrives right after a large scroll jump keeps the visible items in place instead of pushing them for a frame. #598
+- Fix: On native, `initialScrollIndex` lands on its target without a visible jump on mount when item sizes miss their estimate, with no added mount delay. #600
+- Fix: Lists using both `alignItemsAtEnd` and `maintainScrollAtEnd` keep the last visible row in place when rows resize or data changes, so loading older messages no longer moves the newest ones. #597
+- Fix: Rows stay mounted when `itemLayoutAnimation` is turned off and on again. Lists that never use it keep the plain position view.
+- Fix: On native, `scrollToOffset` reports the correct first visible row when called after the list shrinks, even if a scroll correction is still pending.
+- Fix: Throttled `onScroll` callbacks drop pending events when throttling is turned off or the list unmounts.
+- Perf: Scrolling does less work per event. Edge checks are skipped while the list is far from both edges, including after a drag, adaptive render and velocity work is skipped when unused, and the `onScroll` throttle keeps one timer per window instead of resetting it on every event.
+- Perf: `AnimatedLegendList` skips JS throttling for native Reanimated scroll worklets and avoids an extra list render when the ref attaches.
+- Perf: Scroll range passes can skip unchanged containers, notify each container subscriber once per pass, and reuse the settle timer across scroll events.
+- Perf: Row positions stay current when a row's first measurement matches its estimate, and measured sizes round to the nearest eighth of a point instead of down, so rows no longer shift 0.125 pt in an extra reposition pass.
+- Perf: Lists with a large draw distance show the first rows before mounting spare containers and widening the range over several frames.
+- Perf: On Fabric, lists without `anchoredEndSpace` update the content size and row positions in the same commit.
+
+## 3.9.1
+
+- Perf: Lists wait until after first paint to widen the initial render range, so first rows render as fast as before while fast scrolls still find rows ready.
+
+## 3.9.0
+
+- Feat: `showImmediately` renders rows on the first commit from an estimated viewport, before layout. It is opt-in; wrong size estimates or an initial scroll target can shift the first frame.
+- Fix: On web, lists following the end stay at the end while rows are measured, including after a large content shrink.
+- Fix: Changing `numColumns` takes effect when the list renders again before layout, as in Strict Mode.
+
+## 3.8.0
+
+- Feat: `maintainVisibleContentPosition.autoscrollToTopThreshold` animates the list to the start after a prepend when the previous offset is at or within the threshold.
+- Fix: In `KeyboardAwareLegendList`, collapsing or deleting a row no longer drops the anchored message or detaches the footer from the rows while the list shrinks, with the keyboard open or closed. #595
+- Fix: Capped chats that trim old rows from the front keep following the end as new rows arrive. #462
+
+## 3.7.3
+
+- Fix: scrollToOffset and scrollToIndex land at their target even when rows above are measured during the scroll.
+- Fix: Pinned sticky headers report their pinned position to measure() after scrolling stops.
+- Fix: While following the end on native, a row re-measure or a taller viewport now lands at the new end in the same pass instead of a frame later.
+- Fix: Ignore NaN item measurements from Fabric measure(), which could loop until "Maximum update depth exceeded".
+- Fix: On web, rows inside a CSS-transformed (scaled) ancestor are measured at their layout size, so they no longer keep a scaled size and leave gaps.
+- Fix: With minimumViewTime, a row becomes viewable only after it has stayed visible for the full time itself. Leaving resets its dwell, and a callback or config replaced during a pending dwell takes effect without another scroll.
+- Fix: On web, pressing Home keeps the list at the top when rows are measured during or after the browser's scroll.
+- Fix: Native sticky headers no longer add a JS listener to the scroll value, whose removal could race iOS native cleanup when sticky headers, data or the list unmount.
+
+## 3.7.2
+
+- Fix: Preserve web row order and focus, and keep pinned rows updated.
+- Fix: End-following, sticky offsets, and edge callbacks after geometry or data changes.
+- Fix: Preserve anchors through prepends and prevent duplicate pending edge requests.
+- Fix: Keep wheel scrolling responsive.
+- Fix: Prevent native geometry corrections from inventing velocity or reversing the render buffer.
+- Perf: Reduce rendering work through directional buffers, reused size estimates, and faster initial indexing.
+
+## 3.7.1
+
+- Fix: Loading callbacks respond reliably to data changes and new scroll gestures.
+- Fix: Lists preserve scroll positions as rows, insets, and viewport sizes change.
+- Fix: iOS lists with `contentInset.top` now rest at and measure from the inset start.
+- Fix: Keyboard dismissal and interrupted scrolling no longer cause jumps or doubled movement.
+- Fix: Rows stay correctly positioned after items are inserted, removed, or reordered.
+- Perf: Lists prepare more rows before the first scroll.
+
+## 3.7.0
+
+- Feat: `LegendListRef` gains `cancelScroll`, `scrollToKey`, `anchorVisibleContent`; state gains `distanceFromEnd`, `isFollowingEnd`.
+- Feat: Expose end-following state and allow following only newly appended items.
+- Feat: `onUserScroll` reports user scroll gestures.
+- Fix: Scroll promises resolve reliably when scrolling finishes or is interrupted.
+- Fix: Lists follow new content smoothly and respect users scrolling away from the end. #563 #568
+- Fix: Scrolling to the end while closing the keyboard moves smoothly in one motion. #557
+- Fix: Row sizing and layout changes preserve visible content and improve viewability accuracy.
+- Perf: Recycled lists reuse rows more efficiently and process appended data faster.
+
 ## 3.6.0
 
 - Feat: Add `viewPositionFallback` to align oversized items to the start or end of the viewport during initial or programmatic scrolling, while keeping `viewPosition` alignment for items that fit.
